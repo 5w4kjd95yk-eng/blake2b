@@ -18,15 +18,15 @@ jobs:
           - package: bitcoin-bip110
             target: x86
             runner: ubuntu-latest
-          - package: bitcoin-bip110
-            target: arm
-            runner: ubuntu-24.04-arm
+          # - package: bitcoin-bip110
+          #   target: arm
+          #   runner: ubuntu-24.04-arm
           - package: datum-bip110
             target: x86
             runner: ubuntu-latest
-          - package: datum-bip110
-            target: arm
-            runner: ubuntu-24.04-arm
+          # - package: datum-bip110
+          #   target: arm
+          #   runner: ubuntu-24.04-arm
 
     steps:
       - name: Free disk space for the Bitcoin build
