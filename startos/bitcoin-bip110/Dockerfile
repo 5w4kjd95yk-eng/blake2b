@@ -23,17 +23,21 @@ RUN curl --fail --location --silent --show-error \
     && tar --extract --gzip --file /tmp/bitcoin.tar.gz --strip-components=1 \
     && rm /tmp/bitcoin.tar.gz
 
+# Keep this bounded: an unqualified `--parallel` starts hundreds of cc1plus
+# processes and makes GitHub's hosted runners thrash instead of completing.
 RUN cmake -S /src -B /build \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -g0" \
         -DBUILD_BENCH=OFF \
         -DBUILD_GUI=OFF \
         -DBUILD_TESTS=OFF \
+        -DENABLE_EXTERNAL_SIGNER=OFF \
+        -DENABLE_TOR_SUBPROCESS=OFF \
         -DENABLE_WALLET=OFF \
         -DRDTS_CONSENT=IMPLICIT \
         -DWITH_BDB=OFF \
         -DWITH_ZMQ=OFF \
-    && cmake --build /build --parallel --target bitcoind bitcoin-cli
+    && cmake --build /build --parallel 2 --target bitcoind bitcoin-cli
 
 FROM debian:bookworm-slim
 
