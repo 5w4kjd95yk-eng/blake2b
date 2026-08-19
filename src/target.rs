@@ -58,6 +58,14 @@ impl Target {
     pub fn as_hex(&self) -> String {
         hex::encode(self.0)
     }
+
+    pub fn words_be(&self) -> [u64; 4] {
+        let mut words = [0u64; 4];
+        for (word, bytes) in words.iter_mut().zip(self.0.chunks_exact(8)) {
+            *word = u64::from_be_bytes(bytes.try_into().unwrap());
+        }
+        words
+    }
 }
 
 impl fmt::Debug for Target {

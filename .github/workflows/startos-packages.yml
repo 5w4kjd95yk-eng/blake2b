@@ -1,0 +1,76 @@
+name: Build StartOS BIP110 Packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.package }} (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: bitcoin-bip110
+            target: x86
+            runner: ubuntu-latest
+          - package: bitcoin-bip110
+            target: arm
+            runner: ubuntu-24.04-arm
+          - package: datum-bip110
+            target: x86
+            runner: ubuntu-latest
+          - package: datum-bip110
+            target: arm
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Free disk space for the Bitcoin build
+        if: matrix.package == 'bitcoin-bip110'
+        uses: Start9Labs/start-technologies/.github/actions/free-disk-space@master
+
+      - name: Set up the StartOS build environment
+        uses: Start9Labs/start-technologies/.github/actions/setup-build-env@master
+
+      - name: Check out this repository
+        uses: actions/checkout@v6
+
+      - name: Create an ephemeral package signing key
+        shell: bash
+        run: |
+          start-cli init-key
+          mkdir -p .startos
+          cp ~/.startos/id.key.pem .startos/build.key.pem
+
+      - name: Install package SDK dependencies
+        working-directory: startos/${{ matrix.package }}
+        run: npm ci
+
+      - name: Type-check the package controller
+        working-directory: startos/${{ matrix.package }}
+        run: npm run check
+
+      - name: Build the installable package
+        working-directory: startos/${{ matrix.package }}
+        env:
+          RUST_BACKTRACE: '1'
+          RUST_LOG: debug
+        run: make ${{ matrix.target }}
+
+      - name: Record checksums
+        working-directory: startos/${{ matrix.package }}
+        shell: bash
+        run: sha256sum *.s9pk
+
+      - name: Upload the installable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}-${{ matrix.target }}
+          path: startos/${{ matrix.package }}/*.s9pk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

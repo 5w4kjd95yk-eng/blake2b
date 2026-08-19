@@ -14,9 +14,28 @@ pub enum ByteOrder {
     Little,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceMode {
+    #[default]
+    Cpu,
+    Gpu,
+    Both,
+}
+
+impl DeviceMode {
+    pub fn uses_cpu(self) -> bool {
+        matches!(self, Self::Cpu | Self::Both)
+    }
+
+    pub fn uses_gpu(self) -> bool {
+        matches!(self, Self::Gpu | Self::Both)
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about, group(
-  ArgGroup::new("mode").required(true).args(["sia", "normal"])
+  ArgGroup::new("mode").required(true).args(["sia", "datum", "normal"])
 ))]
 pub struct Args {
     /// YAML configuration file.
@@ -37,6 +56,14 @@ pub struct Args {
     #[arg(short = 't', long)]
     pub threads: Option<usize>,
 
+    /// Hashing device: cpu, gpu, or both.
+    #[arg(long, value_enum)]
+    pub device: Option<DeviceMode>,
+
+    /// Nonces dispatched in each Metal command buffer.
+    #[arg(long)]
+    pub gpu_batch_size: Option<u32>,
+
     /// Hash locally instead of connecting to a pool.
     #[arg(long)]
     pub benchmark: bool,
@@ -44,6 +71,10 @@ pub struct Args {
     /// Mine Sia's 80-byte block-header layout and Sia Stratum V1 jobs.
     #[arg(long)]
     pub sia: bool,
+
+    /// Mine the experimental DATUM BIP-110 profile-0 work layout.
+    #[arg(long)]
+    pub datum: bool,
 
     /// Mine raw Blake2b-256 blobs using the configured nonce layout.
     #[arg(long)]
@@ -53,6 +84,7 @@ pub struct Args {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Sia,
+    Datum,
     Normal,
 }
 
@@ -63,6 +95,8 @@ struct FileConfig {
     username: Option<String>,
     password: Option<String>,
     threads: Option<usize>,
+    device: Option<DeviceMode>,
+    gpu_batch_size: Option<u32>,
     nonce_offset: Option<usize>,
     nonce_size: Option<usize>,
     nonce_endian: Option<ByteOrder>,
@@ -77,6 +111,8 @@ pub struct Config {
     pub username: String,
     pub password: String,
     pub threads: usize,
+    pub device: DeviceMode,
+    pub gpu_batch_size: u32,
     pub nonce_offset: usize,
     pub nonce_size: usize,
     pub nonce_endian: ByteOrder,
@@ -140,12 +176,21 @@ pub fn load(args: Args) -> Result<Config> {
     if !(1..=8).contains(&nonce_size) {
         bail!("nonce_size must be between 1 and 8 bytes");
     }
+    let gpu_batch_size = args
+        .gpu_batch_size
+        .or(file.gpu_batch_size)
+        .unwrap_or(1_048_576);
+    if gpu_batch_size == 0 {
+        bail!("gpu_batch_size must be greater than zero");
+    }
 
     Ok(Config {
         endpoint: url.endpoint,
         username,
         password,
         threads,
+        device: args.device.or(file.device).unwrap_or_default(),
+        gpu_batch_size,
         nonce_offset: file.nonce_offset.unwrap_or(32),
         nonce_size,
         nonce_endian: file.nonce_endian.unwrap_or_default(),
@@ -153,7 +198,13 @@ pub fn load(args: Args) -> Result<Config> {
         reconnect_delay: Duration::from_secs(file.reconnect_delay_seconds.unwrap_or(5)),
         stats_interval: Duration::from_secs(file.stats_interval_seconds.unwrap_or(5).max(1)),
         benchmark: args.benchmark,
-        mode: if args.sia { Mode::Sia } else { Mode::Normal },
+        mode: if args.sia {
+            Mode::Sia
+        } else if args.datum {
+            Mode::Datum
+        } else {
+            Mode::Normal
+        },
     })
 }
 
@@ -209,5 +260,41 @@ mod tests {
     fn rejects_non_tcp_stratum_scheme() {
         let error = parse_url("stratum+ssl://example.com:443").unwrap_err();
         assert!(error.to_string().contains("unsupported URL scheme"));
+    }
+
+    #[test]
+    fn command_line_selects_gpu_and_batch_size() {
+        let args = Args::try_parse_from([
+            "miner",
+            "--sia",
+            "--benchmark",
+            "--config=missing-test-config.yaml",
+            "--device=gpu",
+            "--gpu-batch-size=65536",
+        ])
+        .unwrap();
+        let config = load(args).unwrap();
+
+        assert_eq!(config.device, DeviceMode::Gpu);
+        assert_eq!(config.gpu_batch_size, 65_536);
+    }
+
+    #[test]
+    fn command_line_selects_datum_mode() {
+        let args = Args::try_parse_from([
+            "miner",
+            "--datum",
+            "--benchmark",
+            "--config=missing-test-config.yaml",
+        ])
+        .unwrap();
+        let config = load(args).unwrap();
+
+        assert_eq!(config.mode, Mode::Datum);
+    }
+
+    #[test]
+    fn protocol_modes_are_mutually_exclusive() {
+        assert!(Args::try_parse_from(["miner", "--sia", "--datum"]).is_err());
     }
 }

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Bitcoin BIP110 Lab">
+  <rect width="256" height="256" rx="52" fill="#101820"/>
+  <circle cx="128" cy="128" r="86" fill="#f7931a"/>
+  <path fill="#fff" d="M169 104c4-27-17-38-45-43l5-20-13-3-5 19-10-2 5-20-13-3-5 20-8-2-18-4-3 14 9 2c5 1 6 5 6 8l-6 23 2 1h-2l-8 32c-1 2-3 5-7 4l-9-2-7 16 17 4 9 2-5 20 13 3 5-20 10 3-5 20 13 3 5-20c34 6 60 4 70-27 8-25-1-39-19-48 13-3 23-12 26-29Zm-28 64c-6 25-48 11-61 8l11-43c13 3 57 9 50 35Zm6-65c-6 23-41 11-52 8l9-39c12 3 49 7 43 31Z"/>
+  <path d="M44 210h168" stroke="#69d2e7" stroke-width="12" stroke-linecap="round"/>
+</svg>

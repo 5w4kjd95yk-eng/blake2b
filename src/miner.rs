@@ -16,8 +16,10 @@ use serde_json::Value;
 
 use crate::{
     config::{ByteOrder, Config, Endpoint, Mode},
+    gpu,
     hash::PreparedBlock,
-    protocol::{self, JobSpec, SessionState},
+    protocol::{self, JobSpec, SessionState, Submit},
+    target::Target,
 };
 
 const NONCES_PER_RESERVATION: u64 = 16_384;
@@ -53,6 +55,31 @@ struct Share {
     nonce: u64,
 }
 
+#[derive(Default)]
+struct HashCounters {
+    cpu: AtomicU64,
+    gpu: AtomicU64,
+}
+
+impl HashCounters {
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.cpu.load(Ordering::Relaxed),
+            self.gpu.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[derive(Clone)]
+struct WorkerContext {
+    current: Arc<ArcSwapOption<Work>>,
+    active_epoch: Arc<AtomicU64>,
+    hashes: Arc<HashCounters>,
+    stop: Arc<AtomicBool>,
+    gpu_failed: Arc<AtomicBool>,
+    shares: Sender<Share>,
+}
+
 pub fn run(config: Config) -> Result<()> {
     if config.benchmark {
         return benchmark(&config);
@@ -63,28 +90,50 @@ pub fn run(config: Config) -> Result<()> {
     ctrlc::set_handler(move || stop_signal.store(true, Ordering::Release))
         .context("install Ctrl-C handler")?;
 
+    let gpu_backend = if config.device.uses_gpu() {
+        let backend = gpu::Miner::new(config.gpu_batch_size)?;
+        eprintln!(
+            "Metal GPU: {} batch_size={}",
+            backend.device_name(),
+            backend.batch_size()
+        );
+        Some(backend)
+    } else {
+        None
+    };
     let current = Arc::new(ArcSwapOption::<Work>::empty());
     let active_epoch = Arc::new(AtomicU64::new(0));
-    let hashes = Arc::new(AtomicU64::new(0));
+    let hashes = Arc::new(HashCounters::default());
+    let gpu_failed = Arc::new(AtomicBool::new(false));
     let (shares_tx, shares_rx) = unbounded();
     let workers = spawn_workers(
-        config.threads,
-        Arc::clone(&current),
-        Arc::clone(&active_epoch),
-        Arc::clone(&hashes),
-        Arc::clone(&stop),
-        shares_tx,
+        &config,
+        gpu_backend,
+        WorkerContext {
+            current: Arc::clone(&current),
+            active_epoch: Arc::clone(&active_epoch),
+            hashes: Arc::clone(&hashes),
+            stop: Arc::clone(&stop),
+            gpu_failed: Arc::clone(&gpu_failed),
+            shares: shares_tx,
+        },
     )?;
 
     eprintln!(
-        "mode={} endpoint={}:{} threads={} simd={}",
+        "mode={} device={:?} endpoint={}:{} cpu_threads={} simd={}",
         match config.mode {
             Mode::Sia => "sia",
+            Mode::Datum => "datum",
             Mode::Normal => "normal",
         },
+        config.device,
         config.endpoint.host,
         config.endpoint.port,
-        config.threads,
+        if config.device.uses_cpu() {
+            config.threads
+        } else {
+            0
+        },
         if cfg!(target_arch = "aarch64") {
             "neon-4way"
         } else {
@@ -110,43 +159,50 @@ pub fn run(config: Config) -> Result<()> {
     for worker in workers {
         let _ = worker.join();
     }
+    if gpu_failed.load(Ordering::Acquire) {
+        bail!("Metal GPU worker failed");
+    }
     Ok(())
 }
 
 fn spawn_workers(
-    count: usize,
-    current: Arc<ArcSwapOption<Work>>,
-    active_epoch: Arc<AtomicU64>,
-    hashes: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-    shares: Sender<Share>,
+    config: &Config,
+    gpu_backend: Option<gpu::Miner>,
+    context: WorkerContext,
 ) -> Result<Vec<thread::JoinHandle<()>>> {
-    (0..count)
-        .map(|index| {
-            let current = Arc::clone(&current);
-            let active_epoch = Arc::clone(&active_epoch);
-            let hashes = Arc::clone(&hashes);
-            let stop = Arc::clone(&stop);
-            let shares = shares.clone();
-            thread::Builder::new()
+    let mut workers = Vec::new();
+    if config.device.uses_cpu() {
+        for index in 0..config.threads {
+            let context = context.clone();
+            let worker = thread::Builder::new()
                 .name(format!("blake2b-{index}"))
-                .spawn(move || worker_loop(current, active_epoch, hashes, stop, shares))
-                .with_context(|| format!("spawn worker {index}"))
-        })
-        .collect()
+                .spawn(move || worker_loop(context))
+                .with_context(|| format!("spawn CPU worker {index}"))?;
+            workers.push(worker);
+        }
+    }
+    if let Some(gpu_backend) = gpu_backend {
+        let context = context.clone();
+        let worker = thread::Builder::new()
+            .name("blake2b-metal".to_owned())
+            .spawn(move || {
+                if let Err(error) = gpu_worker_loop(gpu_backend, &context) {
+                    eprintln!("Metal GPU failed: {error:#}");
+                    context.gpu_failed.store(true, Ordering::Release);
+                    context.stop.store(true, Ordering::Release);
+                }
+            })
+            .context("spawn Metal GPU worker")?;
+        workers.push(worker);
+    }
+    Ok(workers)
 }
 
-fn worker_loop(
-    current: Arc<ArcSwapOption<Work>>,
-    active_epoch: Arc<AtomicU64>,
-    hashes: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-    shares: Sender<Share>,
-) {
+fn worker_loop(context: WorkerContext) {
     let mut pending_hashes = 0u64;
-    while !stop.load(Ordering::Relaxed) {
-        let Some(work) = current.load_full() else {
-            flush_hashes(&hashes, &mut pending_hashes);
+    while !context.stop.load(Ordering::Relaxed) {
+        let Some(work) = context.current.load_full() else {
+            flush_hashes(&context.hashes.cpu, &mut pending_hashes);
             thread::sleep(Duration::from_millis(10));
             continue;
         };
@@ -156,7 +212,7 @@ fn worker_loop(
         let mut offset = 0;
         while offset < NONCES_PER_RESERVATION {
             if offset % STALE_CHECK_INTERVAL == 0
-                && active_epoch.load(Ordering::Relaxed) != work.epoch
+                && context.active_epoch.load(Ordering::Relaxed) != work.epoch
             {
                 break;
             }
@@ -165,7 +221,7 @@ fn worker_loop(
             pending_hashes += 4;
             for (lane, digest) in digests.iter().enumerate() {
                 if work.spec.target.accepts(digest, work.spec.hash_order) {
-                    let _ = shares.send(Share {
+                    let _ = context.shares.send(Share {
                         work: Arc::clone(&work),
                         nonce: nonce.wrapping_add(lane as u64),
                     });
@@ -174,10 +230,41 @@ fn worker_loop(
             offset += 4;
         }
         if pending_hashes >= NONCES_PER_RESERVATION {
-            flush_hashes(&hashes, &mut pending_hashes);
+            flush_hashes(&context.hashes.cpu, &mut pending_hashes);
         }
     }
-    flush_hashes(&hashes, &mut pending_hashes);
+    flush_hashes(&context.hashes.cpu, &mut pending_hashes);
+}
+
+fn gpu_worker_loop(mut miner: gpu::Miner, context: &WorkerContext) -> Result<()> {
+    let mut cached_job: Option<(u64, gpu::Job)> = None;
+    while !context.stop.load(Ordering::Relaxed) {
+        let Some(work) = context.current.load_full() else {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        if cached_job.as_ref().map(|(epoch, _)| *epoch) != Some(work.epoch) {
+            cached_job = Some((work.epoch, gpu::Job::new(&work.spec)?));
+        }
+        let start = work
+            .next_nonce
+            .fetch_add(u64::from(miner.batch_size()), Ordering::Relaxed);
+        let winning_nonces = miner.mine(&cached_job.as_ref().unwrap().1, start)?;
+        context
+            .hashes
+            .gpu
+            .fetch_add(u64::from(miner.batch_size()), Ordering::Relaxed);
+        if context.active_epoch.load(Ordering::Acquire) != work.epoch {
+            continue;
+        }
+        for nonce in winning_nonces {
+            let _ = context.shares.send(Share {
+                work: Arc::clone(&work),
+                nonce,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn flush_hashes(hashes: &AtomicU64, pending: &mut u64) {
@@ -191,7 +278,7 @@ fn run_session(
     config: &Config,
     current: &ArcSwapOption<Work>,
     active_epoch: &AtomicU64,
-    hashes: &AtomicU64,
+    hashes: &HashCounters,
     stop: &AtomicBool,
     shares: &Receiver<Share>,
 ) -> Result<()> {
@@ -211,7 +298,7 @@ fn run_session(
     let mut request_id = 10u64;
     let mut accepted = 0u64;
     let mut rejected = 0u64;
-    let mut last_total = hashes.load(Ordering::Relaxed);
+    let (mut last_cpu, mut last_gpu) = hashes.snapshot();
     let mut last_stats = Instant::now();
     let mut line = String::new();
 
@@ -251,17 +338,22 @@ fn run_session(
 
         if last_stats.elapsed() >= config.stats_interval {
             let now = Instant::now();
-            let total = hashes.load(Ordering::Relaxed);
-            let rate = total.saturating_sub(last_total) as f64
-                / now.duration_since(last_stats).as_secs_f64();
+            let (cpu, gpu) = hashes.snapshot();
+            let seconds = now.duration_since(last_stats).as_secs_f64();
+            let cpu_rate = cpu.saturating_sub(last_cpu) as f64 / seconds;
+            let gpu_rate = gpu.saturating_sub(last_gpu) as f64 / seconds;
+            let total_rate = cpu_rate + gpu_rate;
             eprintln!(
-                "{:.3} MH/s accepted={} rejected={} total_hashes={}",
-                rate / 1_000_000.0,
+                "{:.3} MH/s (cpu={:.3} gpu={:.3}) accepted={} rejected={} total_hashes={}",
+                total_rate / 1_000_000.0,
+                cpu_rate / 1_000_000.0,
+                gpu_rate / 1_000_000.0,
                 accepted,
                 rejected,
-                total
+                cpu + gpu
             );
-            last_total = total;
+            last_cpu = cpu;
+            last_gpu = gpu;
             last_stats = now;
         }
     }
@@ -391,53 +483,76 @@ fn interruptible_sleep(duration: Duration, stop: &AtomicBool) {
 
 fn benchmark(config: &Config) -> Result<()> {
     let blob = [0x5au8; 80];
-    let (offset, size, little_endian) = match config.mode {
-        Mode::Sia => (32, 8, true),
+    let (offset, size, nonce_order, hash_order) = match config.mode {
+        Mode::Sia | Mode::Datum => (32, 8, ByteOrder::Little, ByteOrder::Big),
         Mode::Normal => (
             config.nonce_offset,
             config.nonce_size,
-            config.nonce_endian == ByteOrder::Little,
+            config.nonce_endian,
+            config.hash_byte_order,
         ),
     };
-    let prepared = Arc::new(
-        PreparedBlock::new(&blob, offset, size, little_endian)
-            .context("benchmark nonce layout does not fit its 80-byte blob")?,
-    );
+    let spec = JobSpec {
+        id: "benchmark".to_owned(),
+        blob: blob.to_vec(),
+        target: Target::from_hex("00")?,
+        nonce_offset: offset,
+        nonce_size: size,
+        nonce_order,
+        hash_order,
+        submit: Submit::Normal,
+    };
+    let current = Arc::new(ArcSwapOption::from(Some(Arc::new(Work::new(spec, 1)?))));
+    let active_epoch = Arc::new(AtomicU64::new(1));
+    let hashes = Arc::new(HashCounters::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let gpu_failed = Arc::new(AtomicBool::new(false));
+    let (shares, _unused_receiver) = unbounded();
+    let gpu_backend = if config.device.uses_gpu() {
+        let backend = gpu::Miner::new(config.gpu_batch_size)?;
+        eprintln!(
+            "Metal GPU: {} batch_size={}",
+            backend.device_name(),
+            backend.batch_size()
+        );
+        Some(backend)
+    } else {
+        None
+    };
+    let workers = spawn_workers(
+        config,
+        gpu_backend,
+        WorkerContext {
+            current: Arc::clone(&current),
+            active_epoch: Arc::clone(&active_epoch),
+            hashes: Arc::clone(&hashes),
+            stop: Arc::clone(&stop),
+            gpu_failed: Arc::clone(&gpu_failed),
+            shares,
+        },
+    )?;
     let duration = Duration::from_secs(3);
     let start = Instant::now();
-    let handles: Vec<_> = (0..config.threads)
-        .map(|index| {
-            let prepared = Arc::clone(&prepared);
-            thread::spawn(move || {
-                let mut hashes = 0u64;
-                let mut nonce = (index as u64) << 48;
-                while start.elapsed() < duration {
-                    for _ in 0..256 {
-                        std::hint::black_box(prepared.hash4(nonce));
-                        nonce = nonce.wrapping_add(4);
-                        hashes += 4;
-                    }
-                }
-                hashes
-            })
-        })
-        .collect();
-    let total: u64 = handles
-        .into_iter()
-        .map(|handle| handle.join().unwrap())
-        .sum();
+    thread::sleep(duration);
+    stop.store(true, Ordering::Release);
+    active_epoch.store(2, Ordering::Release);
+    for worker in workers {
+        let _ = worker.join();
+    }
     let elapsed = start.elapsed();
+    if gpu_failed.load(Ordering::Acquire) {
+        bail!("Metal GPU benchmark failed");
+    }
+    let (cpu, gpu) = hashes.snapshot();
+    let total = cpu + gpu;
     eprintln!(
-        "benchmark: {:.3} MH/s, {} hashes in {:.3}s, {} threads, {}",
+        "benchmark: {:.3} MH/s (cpu={:.3} gpu={:.3}), {} hashes in {:.3}s, device={:?}",
         total as f64 / elapsed.as_secs_f64() / 1_000_000.0,
+        cpu as f64 / elapsed.as_secs_f64() / 1_000_000.0,
+        gpu as f64 / elapsed.as_secs_f64() / 1_000_000.0,
         total,
         elapsed.as_secs_f64(),
-        config.threads,
-        if cfg!(target_arch = "aarch64") {
-            "NEON 4-way"
-        } else {
-            "scalar 4-way"
-        }
+        config.device,
     );
     Ok(())
 }

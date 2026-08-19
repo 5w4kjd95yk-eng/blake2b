@@ -1,0 +1,27 @@
+{
+  "name": "bitcoin-bip110-startos",
+  "private": true,
+  "scripts": {
+    "build": "rm -rf ./javascript && ncc build startos/index.ts -o ./javascript",
+    "prettier": "prettier --write startos",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@start9labs/start-sdk": "2.0.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "@vercel/ncc": "^0.38.4",
+    "prettier": "^3.8.1",
+    "typescript": "^6.0.3"
+  },
+  "prettier": {
+    "trailingComma": "all",
+    "tabWidth": 2,
+    "semi": false,
+    "singleQuote": true
+  },
+  "overrides": {
+    "@start9labs/start-sdk": "$@start9labs/start-sdk"
+  }
+}

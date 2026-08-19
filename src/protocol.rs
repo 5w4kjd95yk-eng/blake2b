@@ -22,6 +22,7 @@ pub struct JobSpec {
 #[derive(Clone, Debug)]
 pub enum Submit {
     Sia { extra_nonce2: String, ntime: String },
+    Datum { ntime: String },
     Normal,
 }
 
@@ -32,6 +33,9 @@ impl JobSpec {
                 extra_nonce2,
                 ntime,
             } => json!([username, self.id, extra_nonce2, ntime, nonce]),
+            Submit::Datum { ntime } => {
+                json!([username, self.id, "0000000000000000", ntime, nonce])
+            }
             Submit::Normal => json!([username, self.id, nonce]),
         };
         json!({"id": request_id, "method": "mining.submit", "params": params})
@@ -48,23 +52,27 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn apply_subscribe_response(&mut self, message: &Value, mode: Mode) -> Result<()> {
-        if mode != Mode::Sia {
+        if !matches!(mode, Mode::Sia | Mode::Datum) {
             return Ok(());
         }
+        let protocol = if mode == Mode::Datum { "DATUM" } else { "Sia" };
         let result = message
             .get("result")
             .and_then(Value::as_array)
-            .context("Sia subscription response has no result array")?;
+            .with_context(|| format!("{protocol} subscription response has no result array"))?;
         if result.len() < 3 {
-            bail!("Sia subscription result needs extranonce1 and extranonce2 size");
+            bail!("{protocol} subscription result needs extranonce1 and extranonce2 size");
         }
         self.extra_nonce1 = decode_hex(value_string(&result[1], "extranonce1")?)?;
         self.extra_nonce2_size = result[2]
             .as_u64()
-            .context("Sia extranonce2 size is not an integer")?
+            .with_context(|| format!("{protocol} extranonce2 size is not an integer"))?
             as usize;
         if self.extra_nonce2_size == 0 || self.extra_nonce2_size > 8 {
-            bail!("Sia extranonce2 size must be between 1 and 8 bytes");
+            bail!("{protocol} extranonce2 size must be between 1 and 8 bytes");
+        }
+        if mode == Mode::Datum && self.extra_nonce2_size != 8 {
+            bail!("DATUM BIP-110 requires an 8-byte extranonce2 field");
         }
         Ok(())
     }
@@ -76,7 +84,7 @@ impl SessionState {
         let value = values.first().context("target notification has no value")?;
         let target = match method {
             "mining.set_target" => Target::from_hex(value_string(value, "target")?)?,
-            "mining.set_difficulty" if mode == Mode::Sia => {
+            "mining.set_difficulty" if matches!(mode, Mode::Sia | Mode::Datum) => {
                 Target::from_stratum_difficulty(&difficulty_string(value)?)?
             }
             "mining.set_difficulty" => return Ok(false),
@@ -89,6 +97,7 @@ impl SessionState {
     pub fn parse_job(&mut self, params: &Value, config: &Config) -> Result<JobSpec> {
         match config.mode {
             Mode::Sia => self.parse_sia_job(params),
+            Mode::Datum => self.parse_datum_job(params),
             Mode::Normal => self.parse_normal_job(params, config),
         }
     }
@@ -161,6 +170,60 @@ impl SessionState {
                 extra_nonce2,
                 ntime,
             },
+        })
+    }
+
+    fn parse_datum_job(&self, params: &Value) -> Result<JobSpec> {
+        let params = params
+            .as_array()
+            .context("DATUM mining.notify params are not an array")?;
+        if params.len() != 9 {
+            bail!(
+                "DATUM mining.notify requires exactly 9 parameters, got {}",
+                params.len()
+            );
+        }
+        if self.extra_nonce2_size != 8 {
+            bail!("DATUM job arrived before a valid subscription response");
+        }
+        let target = self
+            .target
+            .clone()
+            .context("DATUM job arrived before mining.set_difficulty or mining.set_target")?;
+        let id = value_string(&params[0], "job ID")?.to_owned();
+        let previous = decode_exact(
+            value_string(&params[1], "previous ASIC input")?,
+            32,
+            "DATUM previous ASIC input",
+        )?;
+        let mid = decode_exact(value_string(&params[2], "mid")?, 32, "DATUM BIP-110 mid")?;
+        if !value_string(&params[3], "reserved coinb2")?.is_empty() {
+            bail!("DATUM BIP-110 coinb2 field must be empty");
+        }
+        let branches = params[4]
+            .as_array()
+            .context("DATUM BIP-110 branch field is not an array")?;
+        if !branches.is_empty() {
+            bail!("DATUM BIP-110 branch field must be empty");
+        }
+        let ntime = value_string(&params[7], "ntime8")?.to_owned();
+        let ntime_bytes = decode_exact(&ntime, 8, "DATUM BIP-110 ntime8")?;
+
+        let mut header = Vec::with_capacity(80);
+        header.extend_from_slice(&previous);
+        header.extend_from_slice(&[0u8; 8]);
+        header.extend_from_slice(&ntime_bytes);
+        header.extend_from_slice(&mid);
+
+        Ok(JobSpec {
+            id,
+            blob: header,
+            target,
+            nonce_offset: 32,
+            nonce_size: 8,
+            nonce_order: ByteOrder::Little,
+            hash_order: ByteOrder::Big,
+            submit: Submit::Datum { ntime },
         })
     }
 
@@ -314,7 +377,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::config::Endpoint;
+    use crate::config::{DeviceMode, Endpoint};
 
     fn config(mode: Mode) -> Config {
         Config {
@@ -325,6 +388,8 @@ mod tests {
             username: "worker".to_owned(),
             password: "x".to_owned(),
             threads: 1,
+            device: DeviceMode::Cpu,
+            gpu_batch_size: 1024,
             nonce_offset: 4,
             nonce_size: 8,
             nonce_endian: ByteOrder::Little,
@@ -395,5 +460,78 @@ mod tests {
         assert_eq!(job.nonce_size, 4);
         assert_eq!(job.nonce_order, ByteOrder::Big);
         assert_eq!(job.hash_order, ByteOrder::Little);
+    }
+
+    #[test]
+    fn builds_datum_bip110_header_and_submission() {
+        let mut session = SessionState::default();
+        session
+            .apply_subscribe_response(&json!({"result": [[], "01020304", 8]}), Mode::Datum)
+            .unwrap();
+        session
+            .apply_target("mining.set_difficulty", &json!([1]), Mode::Datum)
+            .unwrap();
+        let previous = "11".repeat(32);
+        let mid = "22".repeat(32);
+        let ntime = "0102030405060708";
+        let params = json!([
+            "datum-job",
+            previous,
+            mid,
+            "",
+            [],
+            "20000000",
+            "207fffff",
+            ntime,
+            true
+        ]);
+        let job = session.parse_job(&params, &config(Mode::Datum)).unwrap();
+
+        assert_eq!(job.blob.len(), 80);
+        assert_eq!(&job.blob[..32], &[0x11; 32]);
+        assert_eq!(&job.blob[32..40], &[0; 8]);
+        assert_eq!(&job.blob[40..48], hex::decode("0102030405060708").unwrap());
+        assert_eq!(&job.blob[48..], &[0x22; 32]);
+        assert_eq!(job.nonce_offset, 32);
+        assert_eq!(job.nonce_size, 8);
+        assert_eq!(job.nonce_order, ByteOrder::Little);
+        assert_eq!(job.hash_order, ByteOrder::Big);
+        assert_eq!(
+            job.submission("local.worker", 10, "8877665544332211".to_owned())["params"],
+            json!([
+                "local.worker",
+                "datum-job",
+                "0000000000000000",
+                "0102030405060708",
+                "8877665544332211"
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_non_profile_zero_datum_package() {
+        let mut session = SessionState::default();
+        session
+            .apply_subscribe_response(&json!({"result": [[], "01020304", 8]}), Mode::Datum)
+            .unwrap();
+        session
+            .apply_target("mining.set_difficulty", &json!([1]), Mode::Datum)
+            .unwrap();
+        let params = json!([
+            "datum-job",
+            "11".repeat(32),
+            "22".repeat(32),
+            "unexpected",
+            [],
+            "20000000",
+            "207fffff",
+            "00".repeat(8),
+            true
+        ]);
+
+        let error = session
+            .parse_job(&params, &config(Mode::Datum))
+            .unwrap_err();
+        assert!(error.to_string().contains("coinb2 field must be empty"));
     }
 }
