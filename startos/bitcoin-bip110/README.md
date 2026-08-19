@@ -9,4 +9,8 @@ mines real, validated SHA256d regtest blocks through height 19. BLAKE2b
 activates at height 20, which is left for the DATUM gateway and external miner.
 This avoids IBD without falsifying validation state.
 
+The image is compiled with `RDTS_CONSENT=IMPLICIT`. This is an intentional
+build-time acceptance of BIP110/RDTS for this explicitly named experimental
+lab package, so the headless StartOS daemon does not stop for runtime consent.
+
 Supported StartOS architectures: x86_64 and aarch64.
