@@ -1,10 +1,10 @@
 import { IMPOSSIBLE, VersionInfo } from '@start9labs/start-sdk'
 
 export const current = VersionInfo.of({
-  version: '0.1.0:2',
+  version: '0.1.0:3',
   releaseNotes: {
     en_US:
-      'Fix the generated regtest configuration so the network-specific RPC bind and port settings are accepted by bitcoind.',
+      'Fix the BIP110 health check under the C.UTF-8 locale, and keep the corrected network-specific regtest RPC configuration.',
   },
   migrations: {
     up: async () => {},

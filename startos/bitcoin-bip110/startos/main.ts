@@ -46,7 +46,9 @@ export const main = sdk.setupMain(async ({ effects }) => {
 
         return {
           message: i18n('Ready for BLAKE2b mining at height ${height}', {
-            height,
+            // StartOS may set LANG=C.UTF-8, which is not accepted by Intl.
+            // Passing display-only values as text avoids locale formatting.
+            height: String(height),
           }),
           result: 'success' as const,
         }
