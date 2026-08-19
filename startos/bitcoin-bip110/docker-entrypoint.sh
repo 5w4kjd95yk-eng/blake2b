@@ -23,11 +23,9 @@ discover=0
 upnp=0
 natpmp=0
 
-# The RPC port is bound only through StartOS. These credentials protect only
-# valueless regtest state and are shared with the companion DATUM package.
-rpcbind=0.0.0.0
+# These credentials protect only valueless regtest state and are shared with
+# the companion DATUM package.
 rpcallowip=0.0.0.0/0
-rpcport=18443
 rpcuser=datum
 rpcpassword=bip110-regtest-lab
 
@@ -37,6 +35,12 @@ blake2b_headline=BIP110-LAB
 
 disablewallet=1
 txindex=0
+
+# Bitcoin requires network-specific RPC bind settings to live in the selected
+# network section. The RPC port is exposed only through StartOS.
+[regtest]
+rpcbind=0.0.0.0
+rpcport=18443
 EOF
 
 bootstrap_regtest() {
