@@ -21,6 +21,7 @@ Edit `config.yaml`:
 
 ```yaml
 stratum_url: "stratum+tcp://pool.acme.com:5575"
+socks5_proxy: null # e.g. "127.0.0.1:25344"; proxy resolves the pool hostname
 username: "wallet.worker"
 password: "x"
 threads: 0 # automatic; Datum both-mode reserves one logical CPU for Metal
@@ -44,6 +45,8 @@ stratum_url: "stratum+tcp://wallet.worker:x@pool.acme.com:5575"
 ```
 
 Plain `stratum+tcp` does not encrypt credentials or jobs.
+When `socks5_proxy` is set, connection and destination DNS resolution go through
+that proxy. Failure is fail-closed; the miner does not retry the pool directly.
 
 ## Run
 

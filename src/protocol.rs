@@ -385,6 +385,7 @@ mod tests {
                 host: "localhost".to_owned(),
                 port: 3333,
             },
+            socks5_proxy: None,
             username: "worker".to_owned(),
             password: "x".to_owned(),
             threads: 1,

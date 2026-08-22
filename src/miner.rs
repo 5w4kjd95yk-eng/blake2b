@@ -1,6 +1,6 @@
 use std::{
-    io::{BufRead, BufReader, ErrorKind, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
+    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -315,7 +315,7 @@ fn run_session(
     stop: &AtomicBool,
     shares: &Receiver<Share>,
 ) -> Result<()> {
-    let stream = connect(&config.endpoint)?;
+    let stream = connect(&config.endpoint, config.socks5_proxy.as_ref())?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_millis(25)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -326,7 +326,14 @@ fn run_session(
         &protocol::authorize_request(&config.username, &config.password),
     )?;
 
-    eprintln!("Stratum connected");
+    if let Some(proxy) = &config.socks5_proxy {
+        eprintln!(
+            "Stratum connected through SOCKS5 proxy {}:{}",
+            proxy.host, proxy.port
+        );
+    } else {
+        eprintln!("Stratum connected directly");
+    }
     let mut session = SessionState::default();
     let mut request_id = 10u64;
     let mut accepted = 0u64;
@@ -483,13 +490,51 @@ fn write_message(stream: &mut TcpStream, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn connect(endpoint: &Endpoint) -> Result<TcpStream> {
-    let addresses = (endpoint.host.as_str(), endpoint.port)
+fn connect(endpoint: &Endpoint, socks5_proxy: Option<&Endpoint>) -> Result<TcpStream> {
+    if let Some(proxy) = socks5_proxy {
+        return connect_through_socks5(endpoint, proxy);
+    }
+    connect_direct(endpoint)
+}
+
+fn connect_direct(endpoint: &Endpoint) -> Result<TcpStream> {
+    let addresses = resolve(endpoint, "Stratum endpoint")?;
+    connect_addresses(addresses, endpoint, TcpStream::connect_timeout)
+}
+
+fn connect_through_socks5(endpoint: &Endpoint, proxy: &Endpoint) -> Result<TcpStream> {
+    let addresses = resolve(proxy, "SOCKS5 proxy")?;
+    connect_addresses(addresses, proxy, |address, timeout| {
+        let mut stream = TcpStream::connect_timeout(address, timeout)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        negotiate_socks5(&mut stream, endpoint).map_err(std::io::Error::other)?;
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)?;
+        Ok(stream)
+    })
+    .with_context(|| {
+        format!(
+            "connect to {}:{} through SOCKS5 proxy {}:{}",
+            endpoint.host, endpoint.port, proxy.host, proxy.port
+        )
+    })
+}
+
+fn resolve(endpoint: &Endpoint, description: &str) -> Result<impl Iterator<Item = SocketAddr>> {
+    (endpoint.host.as_str(), endpoint.port)
         .to_socket_addrs()
-        .with_context(|| format!("resolve {}:{}", endpoint.host, endpoint.port))?;
+        .with_context(|| format!("resolve {description} {}:{}", endpoint.host, endpoint.port))
+}
+
+fn connect_addresses(
+    addresses: impl Iterator<Item = SocketAddr>,
+    endpoint: &Endpoint,
+    connector: impl Fn(&SocketAddr, Duration) -> std::io::Result<TcpStream>,
+) -> Result<TcpStream> {
     let mut last_error = None;
     for address in addresses {
-        match connect_address(address) {
+        match connector(&address, Duration::from_secs(10)) {
             Ok(stream) => return Ok(stream),
             Err(error) => last_error = Some(error),
         }
@@ -501,8 +546,58 @@ fn connect(endpoint: &Endpoint) -> Result<TcpStream> {
     bail!("host resolved to no addresses")
 }
 
-fn connect_address(address: SocketAddr) -> std::io::Result<TcpStream> {
-    TcpStream::connect_timeout(&address, Duration::from_secs(10))
+fn negotiate_socks5(stream: &mut TcpStream, endpoint: &Endpoint) -> Result<()> {
+    stream.write_all(&[5, 1, 0])?;
+    let mut greeting = [0u8; 2];
+    stream.read_exact(&mut greeting)?;
+    if greeting != [5, 0] {
+        bail!("SOCKS5 proxy rejected unauthenticated connection");
+    }
+
+    let mut request = vec![5, 1, 0];
+    match endpoint.host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(address)) => {
+            request.push(1);
+            request.extend_from_slice(&address.octets());
+        }
+        Ok(IpAddr::V6(address)) => {
+            request.push(4);
+            request.extend_from_slice(&address.octets());
+        }
+        Err(_) => {
+            let length = u8::try_from(endpoint.host.len())
+                .context("SOCKS5 destination hostname exceeds 255 bytes")?;
+            if length == 0 {
+                bail!("SOCKS5 destination hostname is empty");
+            }
+            request.extend_from_slice(&[3, length]);
+            request.extend_from_slice(endpoint.host.as_bytes());
+        }
+    }
+    request.extend_from_slice(&endpoint.port.to_be_bytes());
+    stream.write_all(&request)?;
+
+    let mut response = [0u8; 4];
+    stream.read_exact(&mut response)?;
+    if response[0] != 5 || response[2] != 0 {
+        bail!("invalid SOCKS5 proxy response");
+    }
+    if response[1] != 0 {
+        bail!("SOCKS5 proxy connection failed with status {}", response[1]);
+    }
+    let address_length = match response[3] {
+        1 => 4,
+        4 => 16,
+        3 => {
+            let mut length = [0u8; 1];
+            stream.read_exact(&mut length)?;
+            usize::from(length[0])
+        }
+        value => bail!("SOCKS5 proxy returned unknown address type {value}"),
+    };
+    let mut ignored = vec![0u8; address_length + 2];
+    stream.read_exact(&mut ignored)?;
+    Ok(())
 }
 
 fn interruptible_sleep(duration: Duration, stop: &AtomicBool) {
@@ -593,4 +688,65 @@ fn benchmark(config: &Config) -> Result<()> {
         config.device,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn socks5_proxy_resolves_destination_hostname() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).unwrap();
+
+            let mut request = [0u8; 5];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(request[..4], [5, 1, 0, 3]);
+            let mut hostname = vec![0u8; usize::from(request[4])];
+            stream.read_exact(&mut hostname).unwrap();
+            assert_eq!(hostname, b"unresolvable.invalid");
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).unwrap();
+            assert_eq!(u16::from_be_bytes(port), 23_110);
+            stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        });
+
+        let endpoint = Endpoint {
+            host: "unresolvable.invalid".to_owned(),
+            port: 23_110,
+        };
+        let proxy = Endpoint {
+            host: proxy_address.ip().to_string(),
+            port: proxy_address.port(),
+        };
+        connect_through_socks5(&endpoint, &proxy).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn configured_proxy_failure_does_not_fall_back_to_direct_connection() {
+        let destination = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let destination_address = destination.local_addr().unwrap();
+        let unavailable_proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let proxy_address = unavailable_proxy.local_addr().unwrap();
+        drop(unavailable_proxy);
+
+        let endpoint = Endpoint {
+            host: destination_address.ip().to_string(),
+            port: destination_address.port(),
+        };
+        let proxy = Endpoint {
+            host: proxy_address.ip().to_string(),
+            port: proxy_address.port(),
+        };
+        assert!(connect(&endpoint, Some(&proxy)).is_err());
+    }
 }

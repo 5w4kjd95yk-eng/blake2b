@@ -46,6 +46,10 @@ pub struct Args {
     #[arg(long, alias = "startum-url")]
     pub stratum_url: Option<String>,
 
+    /// SOCKS5 proxy as host:port. Destination DNS is resolved by the proxy.
+    #[arg(long)]
+    pub socks5_proxy: Option<String>,
+
     #[arg(long)]
     pub username: Option<String>,
 
@@ -92,6 +96,7 @@ pub enum Mode {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     stratum_url: Option<String>,
+    socks5_proxy: Option<String>,
     username: Option<String>,
     password: Option<String>,
     threads: Option<usize>,
@@ -108,6 +113,7 @@ struct FileConfig {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub endpoint: Endpoint,
+    pub socks5_proxy: Option<Endpoint>,
     pub username: String,
     pub password: String,
     pub threads: usize,
@@ -164,6 +170,11 @@ pub fn load(args: Args) -> Result<Config> {
         .or(file.stratum_url)
         .unwrap_or_else(|| "stratum+tcp://127.0.0.1:3333".to_owned());
     let url = parse_url(&raw_url)?;
+    let socks5_proxy = args
+        .socks5_proxy
+        .or(file.socks5_proxy)
+        .map(|value| parse_proxy(&value))
+        .transpose()?;
     let username = args
         .username
         .or(url.username)
@@ -199,6 +210,7 @@ pub fn load(args: Args) -> Result<Config> {
 
     Ok(Config {
         endpoint: url.endpoint,
+        socks5_proxy,
         username,
         password,
         threads,
@@ -243,6 +255,23 @@ fn decode(value: &str) -> String {
     percent_decode_str(value).decode_utf8_lossy().into_owned()
 }
 
+fn parse_proxy(raw: &str) -> Result<Endpoint> {
+    let url = Url::parse(&format!("socks5://{raw}"))
+        .with_context(|| format!("invalid SOCKS5 proxy {raw:?}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("SOCKS5 proxy authentication is not supported");
+    }
+    if url.path() != "" && url.path() != "/" {
+        bail!("SOCKS5 proxy must not contain a path");
+    }
+    let host = url
+        .host_str()
+        .context("SOCKS5 proxy has no host")?
+        .to_owned();
+    let port = url.port().context("SOCKS5 proxy has no port")?;
+    Ok(Endpoint { host, port })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +296,18 @@ mod tests {
     fn rejects_non_tcp_stratum_scheme() {
         let error = parse_url("stratum+ssl://example.com:443").unwrap_err();
         assert!(error.to_string().contains("unsupported URL scheme"));
+    }
+
+    #[test]
+    fn parses_socks5_proxy() {
+        assert_eq!(
+            parse_proxy("127.0.0.1:25344").unwrap(),
+            Endpoint {
+                host: "127.0.0.1".to_owned(),
+                port: 25_344,
+            }
+        );
+        assert!(parse_proxy("user:password@127.0.0.1:25344").is_err());
     }
 
     #[test]
