@@ -92,11 +92,7 @@ pub fn run(config: Config) -> Result<()> {
 
     let gpu_backend = if config.device.uses_gpu() {
         let backend = gpu::Miner::new(config.gpu_batch_size)?;
-        eprintln!(
-            "Metal GPU: {} batch_size={}",
-            backend.device_name(),
-            backend.batch_size()
-        );
+        log_gpu_backend(&config, &backend);
         Some(backend)
     } else {
         None
@@ -163,6 +159,22 @@ pub fn run(config: Config) -> Result<()> {
         bail!("Metal GPU worker failed");
     }
     Ok(())
+}
+
+fn log_gpu_backend(config: &Config, backend: &gpu::Miner) {
+    if config.mode == Mode::Datum {
+        eprintln!(
+            "Metal GPU: {} batch_size={} kernel=datum-split32 nonces/thread=4 threads/threadgroup=64",
+            backend.device_name(),
+            backend.batch_size()
+        );
+    } else {
+        eprintln!(
+            "Metal GPU: {} batch_size={} kernel=generic",
+            backend.device_name(),
+            backend.batch_size()
+        );
+    }
 }
 
 fn spawn_workers(
@@ -540,11 +552,7 @@ fn benchmark(config: &Config) -> Result<()> {
     let (shares, _unused_receiver) = unbounded();
     let gpu_backend = if config.device.uses_gpu() {
         let backend = gpu::Miner::new(config.gpu_batch_size)?;
-        eprintln!(
-            "Metal GPU: {} batch_size={}",
-            backend.device_name(),
-            backend.batch_size()
-        );
+        log_gpu_backend(config, &backend);
         Some(backend)
     } else {
         None

@@ -23,9 +23,9 @@ Edit `config.yaml`:
 stratum_url: "stratum+tcp://pool.acme.com:5575"
 username: "wallet.worker"
 password: "x"
-threads: 0 # all logical CPUs
+threads: 0 # automatic; Datum both-mode reserves one logical CPU for Metal
 device: both # cpu, gpu, or both
-gpu_batch_size: 1048576
+gpu_batch_size: 1048576 # use 16777216 for balanced M4 Datum throughput
 
 # Used by --normal. --sia and --datum use fixed 80-byte layouts.
 nonce_offset: 32

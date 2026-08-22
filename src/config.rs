@@ -151,6 +151,14 @@ pub fn load(args: Args) -> Result<Config> {
         );
     };
 
+    let mode = if args.sia {
+        Mode::Sia
+    } else if args.datum {
+        Mode::Datum
+    } else {
+        Mode::Normal
+    };
+    let device = args.device.or(file.device).unwrap_or_default();
     let raw_url = args
         .stratum_url
         .or(file.stratum_url)
@@ -166,11 +174,16 @@ pub fn load(args: Args) -> Result<Config> {
         .or(url.password)
         .or(file.password)
         .unwrap_or_else(|| "x".to_owned());
-    let threads = args.threads.or(file.threads).unwrap_or(0);
-    let threads = if threads == 0 {
-        std::thread::available_parallelism().map_or(1, usize::from)
+    let requested_threads = args.threads.or(file.threads).unwrap_or(0);
+    let threads = if requested_threads == 0 {
+        let available = std::thread::available_parallelism().map_or(1, usize::from);
+        if mode == Mode::Datum && device == DeviceMode::Both {
+            available.saturating_sub(1).max(1)
+        } else {
+            available
+        }
     } else {
-        threads
+        requested_threads
     };
     let nonce_size = file.nonce_size.unwrap_or(8);
     if !(1..=8).contains(&nonce_size) {
@@ -189,7 +202,7 @@ pub fn load(args: Args) -> Result<Config> {
         username,
         password,
         threads,
-        device: args.device.or(file.device).unwrap_or_default(),
+        device,
         gpu_batch_size,
         nonce_offset: file.nonce_offset.unwrap_or(32),
         nonce_size,
@@ -198,13 +211,7 @@ pub fn load(args: Args) -> Result<Config> {
         reconnect_delay: Duration::from_secs(file.reconnect_delay_seconds.unwrap_or(5)),
         stats_interval: Duration::from_secs(file.stats_interval_seconds.unwrap_or(5).max(1)),
         benchmark: args.benchmark,
-        mode: if args.sia {
-            Mode::Sia
-        } else if args.datum {
-            Mode::Datum
-        } else {
-            Mode::Normal
-        },
+        mode,
     })
 }
 
@@ -286,11 +293,35 @@ mod tests {
             "--datum",
             "--benchmark",
             "--config=missing-test-config.yaml",
+            "--device=both",
         ])
         .unwrap();
         let config = load(args).unwrap();
 
         assert_eq!(config.mode, Mode::Datum);
+        assert_eq!(
+            config.threads,
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .saturating_sub(1)
+                .max(1)
+        );
+    }
+
+    #[test]
+    fn explicit_datum_thread_count_is_authoritative() {
+        let args = Args::try_parse_from([
+            "miner",
+            "--datum",
+            "--benchmark",
+            "--config=missing-test-config.yaml",
+            "--device=both",
+            "--threads=4",
+        ])
+        .unwrap();
+        let config = load(args).unwrap();
+
+        assert_eq!(config.threads, 4);
     }
 
     #[test]
