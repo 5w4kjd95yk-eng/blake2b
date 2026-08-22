@@ -217,10 +217,25 @@ fn worker_loop(context: WorkerContext) {
                 break;
             }
             let nonce = start.wrapping_add(offset);
-            let digests = work.prepared.hash4(nonce);
             pending_hashes += 4;
-            for (lane, digest) in digests.iter().enumerate() {
-                if work.spec.target.accepts(digest, work.spec.hash_order) {
+            if matches!(work.spec.submit, Submit::Datum { .. }) {
+                let mask = work
+                    .prepared
+                    .datum_candidate_mask(nonce, work.spec.target.words_be());
+                for lane in 0..4 {
+                    if mask & (1 << lane) != 0 {
+                        let _ = context.shares.send(Share {
+                            work: Arc::clone(&work),
+                            nonce: nonce.wrapping_add(lane as u64),
+                        });
+                    }
+                }
+            } else {
+                let digests = work.prepared.hash4(nonce);
+                for (lane, digest) in digests.iter().enumerate() {
+                    if !work.spec.target.accepts(digest, work.spec.hash_order) {
+                        continue;
+                    }
                     let _ = context.shares.send(Share {
                         work: Arc::clone(&work),
                         nonce: nonce.wrapping_add(lane as u64),

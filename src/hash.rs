@@ -101,6 +101,30 @@ impl PreparedBlock {
         hash4_one_block(&blocks, self.len)
     }
 
+    pub fn datum_candidate_mask(&self, first_nonce: u64, target: [u64; 4]) -> u8 {
+        debug_assert_eq!(self.len, 80);
+        debug_assert_eq!(self.nonce_offset, 32);
+        debug_assert_eq!(self.nonce_size, 8);
+        debug_assert!(self.nonce_little_endian);
+
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            neon::datum_candidate_mask(&self.words, first_nonce, target)
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let hashes = self.hash4(first_nonce);
+            hashes.iter().enumerate().fold(0u8, |mask, (lane, hash)| {
+                let mut words = [0u64; 4];
+                for (word, bytes) in words.iter_mut().zip(hash.chunks_exact(8)) {
+                    *word = u64::from_be_bytes(bytes.try_into().unwrap());
+                }
+                mask | (u8::from(words <= target) << lane)
+            })
+        }
+    }
+
     pub fn nonce_hex(&self, nonce: u64) -> String {
         let bytes = if self.nonce_little_endian {
             nonce.to_le_bytes()
@@ -258,6 +282,54 @@ mod neon {
         }
 
         #[inline(always)]
+        unsafe fn and(self, rhs: Self) -> Self {
+            Self {
+                lo: vandq_u64(self.lo, rhs.lo),
+                hi: vandq_u64(self.hi, rhs.hi),
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn or(self, rhs: Self) -> Self {
+            Self {
+                lo: vorrq_u64(self.lo, rhs.lo),
+                hi: vorrq_u64(self.hi, rhs.hi),
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn equal(self, rhs: Self) -> Self {
+            Self {
+                lo: vceqq_u64(self.lo, rhs.lo),
+                hi: vceqq_u64(self.hi, rhs.hi),
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn less_than(self, rhs: Self) -> Self {
+            Self {
+                lo: vcltq_u64(self.lo, rhs.lo),
+                hi: vcltq_u64(self.hi, rhs.hi),
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn swap_bytes(self) -> Self {
+            Self {
+                lo: vreinterpretq_u64_u8(vrev64q_u8(vreinterpretq_u8_u64(self.lo))),
+                hi: vreinterpretq_u64_u8(vrev64q_u8(vreinterpretq_u8_u64(self.hi))),
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn mask(self) -> u8 {
+            u8::from(vgetq_lane_u64::<0>(self.lo) != 0)
+                | (u8::from(vgetq_lane_u64::<1>(self.lo) != 0) << 1)
+                | (u8::from(vgetq_lane_u64::<0>(self.hi) != 0) << 2)
+                | (u8::from(vgetq_lane_u64::<1>(self.hi) != 0) << 3)
+        }
+
+        #[inline(always)]
         unsafe fn rotr<const N: i32>(self) -> Self {
             match N {
                 32 => Self {
@@ -322,8 +394,51 @@ mod neon {
         compress4(m, len)
     }
 
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn datum_candidate_mask(
+        words: &[u64; 16],
+        first_nonce: u64,
+        target: [u64; 4],
+    ) -> u8 {
+        let mut m = [U64x4::splat(0); 16];
+        for i in 0..10 {
+            m[i] = U64x4::splat(words[i]);
+        }
+        m[4] = U64x4::new(
+            first_nonce,
+            first_nonce.wrapping_add(1),
+            first_nonce.wrapping_add(2),
+            first_nonce.wrapping_add(3),
+        );
+        let v = compress4_state(m, 80);
+        let mut equal = U64x4::splat(u64::MAX);
+        let mut less = U64x4::splat(0);
+        for i in 0..4 {
+            let initial = if i == 0 { IV[i] ^ 0x0101_0020 } else { IV[i] };
+            let digest = U64x4::splat(initial).xor(v[i]).xor(v[i + 8]).swap_bytes();
+            let target = U64x4::splat(target[i]);
+            less = less.or(equal.and(digest.less_than(target)));
+            equal = equal.and(digest.equal(target));
+        }
+        less.or(equal).mask()
+    }
+
     #[inline(always)]
     unsafe fn compress4(m: [U64x4; 16], len: usize) -> [[u8; 32]; 4] {
+        let v = compress4_state(m, len);
+        let mut output = [[0u8; 32]; 4];
+        for i in 0..4 {
+            let initial = if i == 0 { IV[i] ^ 0x0101_0020 } else { IV[i] };
+            let lanes = U64x4::splat(initial).xor(v[i]).xor(v[i + 8]).lanes();
+            for lane in 0..4 {
+                output[lane][i * 8..i * 8 + 8].copy_from_slice(&lanes[lane].to_le_bytes());
+            }
+        }
+        output
+    }
+
+    #[inline(always)]
+    unsafe fn compress4_state(m: [U64x4; 16], len: usize) -> [U64x4; 16] {
         let mut v = [U64x4::splat(0); 16];
         for i in 0..8 {
             let initial = if i == 0 { IV[i] ^ 0x0101_0020 } else { IV[i] };
@@ -344,15 +459,7 @@ mod neon {
             g(&mut v, 3, 4, 9, 14, m[sigma[14]], m[sigma[15]]);
         }
 
-        let mut output = [[0u8; 32]; 4];
-        for i in 0..4 {
-            let initial = if i == 0 { IV[i] ^ 0x0101_0020 } else { IV[i] };
-            let lanes = U64x4::splat(initial).xor(v[i]).xor(v[i + 8]).lanes();
-            for lane in 0..4 {
-                output[lane][i * 8..i * 8 + 8].copy_from_slice(&lanes[lane].to_le_bytes());
-            }
-        }
-        output
+        v
     }
 
     #[inline(always)]
@@ -398,6 +505,29 @@ mod tests {
             let mut expected_header = header;
             expected_header[32..40].copy_from_slice(&(42 + lane as u64).to_le_bytes());
             assert_eq!(*hash, blake2b256(&expected_header));
+        }
+    }
+
+    #[test]
+    fn datum_candidate_mask_matches_full_digest_comparison() {
+        let header = [0x5au8; 80];
+        let prepared = PreparedBlock::new(&header, 32, 8, true).unwrap();
+        for first_nonce in [42, u64::MAX - 2] {
+            let hashes = prepared.hash4(first_nonce);
+            for target_hash in hashes {
+                let mut target = [0u64; 4];
+                for (word, bytes) in target.iter_mut().zip(target_hash.chunks_exact(8)) {
+                    *word = u64::from_be_bytes(bytes.try_into().unwrap());
+                }
+                let expected = hashes.iter().enumerate().fold(0u8, |mask, (lane, hash)| {
+                    let mut words = [0u64; 4];
+                    for (word, bytes) in words.iter_mut().zip(hash.chunks_exact(8)) {
+                        *word = u64::from_be_bytes(bytes.try_into().unwrap());
+                    }
+                    mask | (u8::from(words <= target) << lane)
+                });
+                assert_eq!(prepared.datum_candidate_mask(first_nonce, target), expected);
+            }
         }
     }
 
