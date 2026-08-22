@@ -400,17 +400,7 @@ mod neon {
         first_nonce: u64,
         target: [u64; 4],
     ) -> u8 {
-        let mut m = [U64x4::splat(0); 16];
-        for i in 0..10 {
-            m[i] = U64x4::splat(words[i]);
-        }
-        m[4] = U64x4::new(
-            first_nonce,
-            first_nonce.wrapping_add(1),
-            first_nonce.wrapping_add(2),
-            first_nonce.wrapping_add(3),
-        );
-        let v = compress4_state(m, 80);
+        let v = compress4_state_datum(words, first_nonce);
         let mut equal = U64x4::splat(u64::MAX);
         let mut less = U64x4::splat(0);
         for i in 0..4 {
@@ -421,6 +411,65 @@ mod neon {
             equal = equal.and(digest.equal(target));
         }
         less.or(equal).mask()
+    }
+
+    #[inline(always)]
+    unsafe fn compress4_state_datum(words: &[u64; 16], first_nonce: u64) -> [U64x4; 16] {
+        let m0 = U64x4::splat(words[0]);
+        let m1 = U64x4::splat(words[1]);
+        let m2 = U64x4::splat(words[2]);
+        let m3 = U64x4::splat(words[3]);
+        let m4 = U64x4::new(
+            first_nonce,
+            first_nonce.wrapping_add(1),
+            first_nonce.wrapping_add(2),
+            first_nonce.wrapping_add(3),
+        );
+        let m5 = U64x4::splat(words[5]);
+        let m6 = U64x4::splat(words[6]);
+        let m7 = U64x4::splat(words[7]);
+        let m8 = U64x4::splat(words[8]);
+        let m9 = U64x4::splat(words[9]);
+        let z = U64x4::splat(0);
+        let mut v = [U64x4::splat(0); 16];
+        for i in 0..8 {
+            let initial = if i == 0 { IV[i] ^ 0x0101_0020 } else { IV[i] };
+            v[i] = U64x4::splat(initial);
+            v[i + 8] = U64x4::splat(IV[i]);
+        }
+        v[12] = v[12].xor(U64x4::splat(80));
+        v[14] = v[14].xor(U64x4::splat(u64::MAX));
+
+        macro_rules! round4 {
+            ($m0:expr, $m1:expr, $m2:expr, $m3:expr,
+             $m4:expr, $m5:expr, $m6:expr, $m7:expr,
+             $m8:expr, $m9:expr, $m10:expr, $m11:expr,
+             $m12:expr, $m13:expr, $m14:expr, $m15:expr) => {{
+                g(&mut v, 0, 4, 8, 12, $m0, $m1);
+                g(&mut v, 1, 5, 9, 13, $m2, $m3);
+                g(&mut v, 2, 6, 10, 14, $m4, $m5);
+                g(&mut v, 3, 7, 11, 15, $m6, $m7);
+                g(&mut v, 0, 5, 10, 15, $m8, $m9);
+                g(&mut v, 1, 6, 11, 12, $m10, $m11);
+                g(&mut v, 2, 7, 8, 13, $m12, $m13);
+                g(&mut v, 3, 4, 9, 14, $m14, $m15);
+            }};
+        }
+
+        round4!(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, z, z, z, z, z, z);
+        round4!(z, z, m4, m8, m9, z, z, m6, m1, z, m0, m2, z, m7, m5, m3);
+        round4!(z, m8, z, m0, m5, m2, z, z, z, z, m3, m6, m7, m1, m9, m4);
+        round4!(m7, m9, m3, m1, z, z, z, z, m2, m6, m5, z, m4, m0, z, m8);
+        round4!(m9, m0, m5, m7, m2, m4, z, z, z, m1, z, z, m6, m8, m3, z);
+        round4!(m2, z, m6, z, m0, z, m8, m3, m4, z, m7, m5, z, z, m1, m9);
+        round4!(z, m5, m1, z, z, z, m4, z, m0, m7, m6, m3, m9, m2, m8, z);
+        round4!(z, z, m7, z, z, m1, m3, m9, m5, m0, z, m4, m8, m6, m2, z);
+        round4!(m6, z, z, m9, z, m3, m0, m8, z, m2, z, m7, m1, m4, z, m5);
+        round4!(z, m2, m8, m4, m7, m6, m1, m5, z, z, m9, z, m3, z, z, m0);
+        round4!(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, z, z, z, z, z, z);
+        round4!(z, z, m4, m8, m9, z, z, m6, m1, z, m0, m2, z, m7, m5, m3);
+
+        v
     }
 
     #[inline(always)]
@@ -510,23 +559,28 @@ mod tests {
 
     #[test]
     fn datum_candidate_mask_matches_full_digest_comparison() {
-        let header = [0x5au8; 80];
-        let prepared = PreparedBlock::new(&header, 32, 8, true).unwrap();
-        for first_nonce in [42, u64::MAX - 2] {
-            let hashes = prepared.hash4(first_nonce);
-            for target_hash in hashes {
-                let mut target = [0u64; 4];
-                for (word, bytes) in target.iter_mut().zip(target_hash.chunks_exact(8)) {
-                    *word = u64::from_be_bytes(bytes.try_into().unwrap());
-                }
-                let expected = hashes.iter().enumerate().fold(0u8, |mask, (lane, hash)| {
-                    let mut words = [0u64; 4];
-                    for (word, bytes) in words.iter_mut().zip(hash.chunks_exact(8)) {
+        for seed in [0u8, 0x5a, 0xff] {
+            let mut header = [0u8; 80];
+            for (index, byte) in header.iter_mut().enumerate() {
+                *byte = seed.wrapping_add((index as u8).wrapping_mul(17));
+            }
+            let prepared = PreparedBlock::new(&header, 32, 8, true).unwrap();
+            for first_nonce in [42, u64::MAX - 2] {
+                let hashes = prepared.hash4(first_nonce);
+                for target_hash in hashes {
+                    let mut target = [0u64; 4];
+                    for (word, bytes) in target.iter_mut().zip(target_hash.chunks_exact(8)) {
                         *word = u64::from_be_bytes(bytes.try_into().unwrap());
                     }
-                    mask | (u8::from(words <= target) << lane)
-                });
-                assert_eq!(prepared.datum_candidate_mask(first_nonce, target), expected);
+                    let expected = hashes.iter().enumerate().fold(0u8, |mask, (lane, hash)| {
+                        let mut words = [0u64; 4];
+                        for (word, bytes) in words.iter_mut().zip(hash.chunks_exact(8)) {
+                            *word = u64::from_be_bytes(bytes.try_into().unwrap());
+                        }
+                        mask | (u8::from(words <= target) << lane)
+                    });
+                    assert_eq!(prepared.datum_candidate_mask(first_nonce, target), expected);
+                }
             }
         }
     }
