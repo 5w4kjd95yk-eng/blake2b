@@ -258,6 +258,12 @@ fn gpu_worker_loop(mut miner: gpu::Miner, context: &WorkerContext) -> Result<()>
             continue;
         }
         for nonce in winning_nonces {
+            if matches!(work.spec.submit, Submit::Datum { .. }) {
+                let digest = work.prepared.hash4(nonce)[0];
+                if !work.spec.target.accepts(&digest, work.spec.hash_order) {
+                    continue;
+                }
+            }
             let _ = context.shares.send(Share {
                 work: Arc::clone(&work),
                 nonce,
@@ -500,7 +506,16 @@ fn benchmark(config: &Config) -> Result<()> {
         nonce_size: size,
         nonce_order,
         hash_order,
-        submit: Submit::Normal,
+        submit: match config.mode {
+            Mode::Datum => Submit::Datum {
+                ntime: "00000000".to_owned(),
+            },
+            Mode::Sia => Submit::Sia {
+                extra_nonce2: String::new(),
+                ntime: "00000000".to_owned(),
+            },
+            Mode::Normal => Submit::Normal,
+        },
     };
     let current = Arc::new(ArcSwapOption::from(Some(Arc::new(Work::new(spec, 1)?))));
     let active_epoch = Arc::new(AtomicU64::new(1));

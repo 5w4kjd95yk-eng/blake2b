@@ -1,6 +1,9 @@
 use anyhow::{bail, Result};
 
-use crate::{config::ByteOrder, protocol::JobSpec};
+use crate::{
+    config::ByteOrder,
+    protocol::{JobSpec, Submit},
+};
 
 #[cfg(target_os = "macos")]
 const MAX_RESULTS: usize = 256;
@@ -15,6 +18,7 @@ pub struct Job {
     nonce_size: u32,
     nonce_little_endian: bool,
     hash_little_endian: bool,
+    datum: bool,
 }
 
 impl Job {
@@ -47,6 +51,7 @@ impl Job {
             nonce_size: spec.nonce_size as u32,
             nonce_little_endian: spec.nonce_order == ByteOrder::Little,
             hash_little_endian: spec.hash_order == ByteOrder::Little,
+            datum: matches!(spec.submit, Submit::Datum { .. }),
         })
     }
 }
@@ -77,12 +82,14 @@ mod imp {
         nonce_little_endian: u32,
         hash_little_endian: u32,
         max_results: u32,
+        nonce_count: u32,
     }
 
     pub struct Miner {
         device_name: String,
         queue: CommandQueue,
-        pipeline: ComputePipelineState,
+        generic_pipeline: ComputePipelineState,
+        datum_pipeline: ComputePipelineState,
         job_buffer: Buffer,
         count_buffer: Buffer,
         result_buffer: Buffer,
@@ -96,12 +103,18 @@ mod imp {
             let library = device
                 .new_library_with_source(SHADER, &options)
                 .map_err(|error| anyhow::anyhow!("compile Metal Blake2b kernel: {error}"))?;
-            let function = library
+            let generic_function = library
                 .get_function("blake2b_mine", None)
                 .map_err(|error| anyhow::anyhow!("load Metal Blake2b kernel: {error}"))?;
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
+            let generic_pipeline = device
+                .new_compute_pipeline_state_with_function(&generic_function)
                 .map_err(|error| anyhow::anyhow!("create Metal compute pipeline: {error}"))?;
+            let datum_function = library
+                .get_function("blake2b_datum_mine", None)
+                .map_err(|error| anyhow::anyhow!("load Metal Datum kernel: {error}"))?;
+            let datum_pipeline = device
+                .new_compute_pipeline_state_with_function(&datum_function)
+                .map_err(|error| anyhow::anyhow!("create Metal Datum pipeline: {error}"))?;
             let shared = MTLResourceOptions::StorageModeShared;
             let job_buffer = device.new_buffer(mem::size_of::<JobParams>() as u64, shared);
             let count_buffer = device.new_buffer(mem::size_of::<u32>() as u64, shared);
@@ -112,7 +125,8 @@ mod imp {
             Ok(Self {
                 device_name,
                 queue,
-                pipeline,
+                generic_pipeline,
+                datum_pipeline,
                 job_buffer,
                 count_buffer,
                 result_buffer,
@@ -143,6 +157,7 @@ mod imp {
                 nonce_little_endian: u32::from(job.nonce_little_endian),
                 hash_little_endian: u32::from(job.hash_little_endian),
                 max_results: MAX_RESULTS as u32,
+                nonce_count: self.batch_size,
             };
             unsafe {
                 ptr::copy_nonoverlapping(
@@ -155,18 +170,31 @@ mod imp {
 
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.pipeline);
+            let pipeline = if job.datum {
+                &self.datum_pipeline
+            } else {
+                &self.generic_pipeline
+            };
+            encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&self.job_buffer), 0);
             encoder.set_buffer(1, Some(&self.count_buffer), 0);
             encoder.set_buffer(2, Some(&self.result_buffer), 0);
-            let execution_width = self.pipeline.thread_execution_width();
-            let group_width = self
-                .pipeline
-                .max_total_threads_per_threadgroup()
-                .min(256)
-                .max(execution_width);
+            let execution_width = pipeline.thread_execution_width();
+            let group_width = if job.datum {
+                64
+            } else {
+                pipeline
+                    .max_total_threads_per_threadgroup()
+                    .min(256)
+                    .max(execution_width)
+            };
+            let thread_count = if job.datum {
+                u64::from(self.batch_size).div_ceil(4)
+            } else {
+                u64::from(self.batch_size)
+            };
             encoder.dispatch_threads(
-                MTLSize::new(self.batch_size as u64, 1, 1),
+                MTLSize::new(thread_count, 1, 1),
                 MTLSize::new(group_width, 1, 1),
             );
             encoder.end_encoding();
@@ -251,6 +279,19 @@ mod tests {
             ByteOrder::Little,
             ByteOrder::Big,
             10_000,
+            Submit::Normal,
+        );
+        verify_layout(
+            &mut miner,
+            vec![0x5a; 80],
+            32,
+            8,
+            ByteOrder::Little,
+            ByteOrder::Big,
+            u32::MAX as u64 - 511,
+            Submit::Datum {
+                ntime: "00000000".to_owned(),
+            },
         );
         verify_layout(
             &mut miner,
@@ -260,6 +301,7 @@ mod tests {
             ByteOrder::Big,
             ByteOrder::Little,
             0x0102_0304,
+            Submit::Normal,
         );
     }
 
@@ -271,6 +313,7 @@ mod tests {
         nonce_order: ByteOrder,
         hash_order: ByteOrder,
         start_nonce: u64,
+        submit: Submit,
     ) {
         let mut hashes = (0..miner.batch_size())
             .map(|offset| {
@@ -299,7 +342,7 @@ mod tests {
             nonce_size,
             nonce_order,
             hash_order,
-            submit: Submit::Normal,
+            submit,
         };
         let mut expected = hashes
             .iter()
