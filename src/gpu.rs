@@ -264,6 +264,16 @@ mod tests {
 
     type ReferenceBlake2b256 = Blake2b<U32>;
 
+    struct TestLayout {
+        blob: Vec<u8>,
+        nonce_offset: usize,
+        nonce_size: usize,
+        nonce_order: ByteOrder,
+        hash_order: ByteOrder,
+        start_nonce: u64,
+        submit: Submit,
+    }
+
     #[test]
     fn metal_matches_reference_for_sia_and_raw_layouts() {
         let Ok(mut miner) = Miner::new(1_024) else {
@@ -273,48 +283,54 @@ mod tests {
 
         verify_layout(
             &mut miner,
-            vec![0x5a; 80],
-            32,
-            8,
-            ByteOrder::Little,
-            ByteOrder::Big,
-            10_000,
-            Submit::Normal,
-        );
-        verify_layout(
-            &mut miner,
-            vec![0x5a; 80],
-            32,
-            8,
-            ByteOrder::Little,
-            ByteOrder::Big,
-            u32::MAX as u64 - 511,
-            Submit::Datum {
-                ntime: "00000000".to_owned(),
+            TestLayout {
+                blob: vec![0x5a; 80],
+                nonce_offset: 32,
+                nonce_size: 8,
+                nonce_order: ByteOrder::Little,
+                hash_order: ByteOrder::Big,
+                start_nonce: 10_000,
+                submit: Submit::Normal,
             },
         );
         verify_layout(
             &mut miner,
-            vec![0xa5; 96],
-            7,
-            4,
-            ByteOrder::Big,
-            ByteOrder::Little,
-            0x0102_0304,
-            Submit::Normal,
+            TestLayout {
+                blob: vec![0x5a; 80],
+                nonce_offset: 32,
+                nonce_size: 8,
+                nonce_order: ByteOrder::Little,
+                hash_order: ByteOrder::Big,
+                start_nonce: u32::MAX as u64 - 511,
+                submit: Submit::Datum {
+                    ntime: "00000000".to_owned(),
+                },
+            },
+        );
+        verify_layout(
+            &mut miner,
+            TestLayout {
+                blob: vec![0xa5; 96],
+                nonce_offset: 7,
+                nonce_size: 4,
+                nonce_order: ByteOrder::Big,
+                hash_order: ByteOrder::Little,
+                start_nonce: 0x0102_0304,
+                submit: Submit::Normal,
+            },
         );
     }
 
-    fn verify_layout(
-        miner: &mut Miner,
-        blob: Vec<u8>,
-        nonce_offset: usize,
-        nonce_size: usize,
-        nonce_order: ByteOrder,
-        hash_order: ByteOrder,
-        start_nonce: u64,
-        submit: Submit,
-    ) {
+    fn verify_layout(miner: &mut Miner, layout: TestLayout) {
+        let TestLayout {
+            blob,
+            nonce_offset,
+            nonce_size,
+            nonce_order,
+            hash_order,
+            start_nonce,
+            submit,
+        } = layout;
         let mut hashes = (0..miner.batch_size())
             .map(|offset| {
                 let nonce = start_nonce + u64::from(offset);
