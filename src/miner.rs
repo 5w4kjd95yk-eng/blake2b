@@ -630,6 +630,7 @@ fn benchmark(config: &Config) -> Result<()> {
         hash_order,
         submit: match config.mode {
             Mode::Datum => Submit::Datum {
+                extra_nonce2: "0000000000000000".to_owned(),
                 ntime: "00000000".to_owned(),
             },
             Mode::Sia => Submit::Sia {

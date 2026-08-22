@@ -303,6 +303,7 @@ mod tests {
                 hash_order: ByteOrder::Big,
                 start_nonce: u32::MAX as u64 - 511,
                 submit: Submit::Datum {
+                    extra_nonce2: "0000000000000000".to_owned(),
                     ntime: "00000000".to_owned(),
                 },
             },

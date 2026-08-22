@@ -64,10 +64,10 @@ Normal mode hashes a raw Blake2b-256 blob with the nonce layout from YAML:
 target/release/blake2b-apple-miner --normal
 ```
 
-DATUM mode implements the experimental BIP-110 profile-0 dialect from
-`Maveth/datum_gateway`'s `bip110-pow-v2` branch. It hashes the gateway's direct
-80-byte ASIC input and submits the fixed zero `extranonce2` required by that
-lab protocol:
+DATUM mode implements the experimental BIP-110 profile-0 dialects from the
+community DATUM gateway forks. It accepts both the current Sia-Stratum job,
+which derives the final 32 ASIC-input bytes from `coinb1` and extranonces, and
+the older direct-mid lab job with a fixed zero `extranonce2`:
 
 ```sh
 target/release/blake2b-apple-miner \
@@ -135,11 +135,10 @@ The compact array form is `[job_id, blob, target, clean_jobs]`. A preceding
 Sia mode accepts the nine-parameter Sia Stratum notification and submits
 `[username, job_id, extranonce2, ntime, nonce]`.
 
-DATUM mode accepts `[job_id, previous_asic, mid, "", [], version, nbits,
-ntime8, clean]`, hashes `previous_asic || nonce8_le || ntime8 || mid`, and
-submits `[username, job_id, "0000000000000000", ntime8, nonce8]`. This mode
-supports the gateway's profile 0 with a null XOR mask; it is not a general
-BIP-110 implementation.
+DATUM mode accepts `[job_id, previous_asic, coinb1_or_mid, coinb2, branches,
+version, nbits, ntime8, clean]`, hashes the resulting profile-0 ASIC input, and
+submits `[username, job_id, extranonce2, ntime8, nonce8]`. This mode supports
+profile 0 with a null XOR mask; it is not a general BIP-110 implementation.
 
 ## StartOS regtest lab
 

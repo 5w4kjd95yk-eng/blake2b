@@ -22,7 +22,7 @@ pub struct JobSpec {
 #[derive(Clone, Debug)]
 pub enum Submit {
     Sia { extra_nonce2: String, ntime: String },
-    Datum { ntime: String },
+    Datum { extra_nonce2: String, ntime: String },
     Normal,
 }
 
@@ -33,9 +33,10 @@ impl JobSpec {
                 extra_nonce2,
                 ntime,
             } => json!([username, self.id, extra_nonce2, ntime, nonce]),
-            Submit::Datum { ntime } => {
-                json!([username, self.id, "0000000000000000", ntime, nonce])
-            }
+            Submit::Datum {
+                extra_nonce2,
+                ntime,
+            } => json!([username, self.id, extra_nonce2, ntime, nonce]),
             Submit::Normal => json!([username, self.id, nonce]),
         };
         json!({"id": request_id, "method": "mining.submit", "params": params})
@@ -173,7 +174,7 @@ impl SessionState {
         })
     }
 
-    fn parse_datum_job(&self, params: &Value) -> Result<JobSpec> {
+    fn parse_datum_job(&mut self, params: &Value) -> Result<JobSpec> {
         let params = params
             .as_array()
             .context("DATUM mining.notify params are not an array")?;
@@ -196,18 +197,45 @@ impl SessionState {
             32,
             "DATUM previous ASIC input",
         )?;
-        let mid = decode_exact(value_string(&params[2], "mid")?, 32, "DATUM BIP-110 mid")?;
-        if !value_string(&params[3], "reserved coinb2")?.is_empty() {
-            bail!("DATUM BIP-110 coinb2 field must be empty");
-        }
+        let coinb1_or_mid = decode_hex(value_string(&params[2], "coinb1 or mid")?)?;
+        let coinb2 = decode_hex(value_string(&params[3], "coinb2")?)?;
         let branches = params[4]
             .as_array()
             .context("DATUM BIP-110 branch field is not an array")?;
-        if !branches.is_empty() {
-            bail!("DATUM BIP-110 branch field must be empty");
-        }
         let ntime = value_string(&params[7], "ntime8")?.to_owned();
         let ntime_bytes = decode_exact(&ntime, 8, "DATUM BIP-110 ntime8")?;
+
+        let (mid, extra_nonce2) =
+            if coinb1_or_mid.len() == 32 && coinb2.is_empty() && branches.is_empty() {
+                (coinb1_or_mid, "0000000000000000".to_owned())
+            } else {
+                let extra_nonce2 = self.allocate_extra_nonce2()?;
+                let mut arbitrary_transaction = Vec::with_capacity(
+                    1 + coinb1_or_mid.len()
+                        + self.extra_nonce1.len()
+                        + self.extra_nonce2_size
+                        + coinb2.len(),
+                );
+                arbitrary_transaction.push(0);
+                arbitrary_transaction.extend_from_slice(&coinb1_or_mid);
+                arbitrary_transaction.extend_from_slice(&self.extra_nonce1);
+                arbitrary_transaction.extend_from_slice(&decode_hex(&extra_nonce2)?);
+                arbitrary_transaction.extend_from_slice(&coinb2);
+                let mut merkle_root = blake2b256(&arbitrary_transaction);
+                for branch in branches {
+                    let branch = decode_exact(
+                        value_string(branch, "merkle branch")?,
+                        32,
+                        "DATUM merkle branch",
+                    )?;
+                    let mut node = [0u8; 65];
+                    node[0] = 1;
+                    node[1..33].copy_from_slice(&branch);
+                    node[33..].copy_from_slice(&merkle_root);
+                    merkle_root = blake2b256(&node);
+                }
+                (merkle_root.to_vec(), extra_nonce2)
+            };
 
         let mut header = Vec::with_capacity(80);
         header.extend_from_slice(&previous);
@@ -223,7 +251,10 @@ impl SessionState {
             nonce_size: 8,
             nonce_order: ByteOrder::Little,
             hash_order: ByteOrder::Big,
-            submit: Submit::Datum { ntime },
+            submit: Submit::Datum {
+                extra_nonce2,
+                ntime,
+            },
         })
     }
 
@@ -510,7 +541,49 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_profile_zero_datum_package() {
+    fn builds_datum_profile_zero_from_sia_stratum_fields() {
+        let mut session = SessionState::default();
+        session
+            .apply_subscribe_response(&json!({"result": [[], "01020304", 8]}), Mode::Datum)
+            .unwrap();
+        session
+            .apply_target("mining.set_difficulty", &json!([1]), Mode::Datum)
+            .unwrap();
+        let previous = "11".repeat(32);
+        let coinb1 = "22".repeat(39);
+        let ntime = "0102030405060708";
+        let params = json!([
+            "datum-sia-job",
+            previous,
+            coinb1,
+            "",
+            [],
+            "30000000",
+            "207fffff",
+            ntime,
+            true
+        ]);
+        let job = session.parse_job(&params, &config(Mode::Datum)).unwrap();
+
+        let mut arbitrary_transaction = vec![0];
+        arbitrary_transaction.extend_from_slice(&[0x22; 39]);
+        arbitrary_transaction.extend_from_slice(&[1, 2, 3, 4]);
+        arbitrary_transaction.extend_from_slice(&[0; 8]);
+        assert_eq!(&job.blob[48..], &blake2b256(&arbitrary_transaction));
+        assert_eq!(
+            job.submission("local.worker", 10, "8877665544332211".to_owned())["params"],
+            json!([
+                "local.worker",
+                "datum-sia-job",
+                "0000000000000000",
+                "0102030405060708",
+                "8877665544332211"
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_non_hexadecimal_datum_coinb2() {
         let mut session = SessionState::default();
         session
             .apply_subscribe_response(&json!({"result": [[], "01020304", 8]}), Mode::Datum)
@@ -533,6 +606,6 @@ mod tests {
         let error = session
             .parse_job(&params, &config(Mode::Datum))
             .unwrap_err();
-        assert!(error.to_string().contains("coinb2 field must be empty"));
+        assert!(error.to_string().contains("invalid hexadecimal"));
     }
 }
