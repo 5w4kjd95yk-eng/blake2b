@@ -1,0 +1,8 @@
+.git
+.github
+*.s9pk
+docker-images
+javascript
+ncc-cache
+node_modules
+

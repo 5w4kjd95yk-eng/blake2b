@@ -1,7 +1,17 @@
-name: Build StartOS BIP110 Packages
+name: Build StartOS Packages
 
 on:
   workflow_dispatch:
+    inputs:
+      package:
+        description: Package to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - bitcoin-bip110
+          - mempool-guide
 
 permissions:
   contents: read
@@ -14,23 +24,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - package: bitcoin-bip110
-            target: x86
-            runner: ubuntu-latest
-          # - package: bitcoin-bip110
-          #   target: arm
-          #   runner: ubuntu-24.04-arm
-          # - package: datum-bip110
-          #   target: x86
-          #   runner: ubuntu-latest
-          # - package: datum-bip110
-          #   target: arm
-          #   runner: ubuntu-24.04-arm
+        include: ${{ fromJSON(inputs.package == 'mempool-guide' && '[{"package":"mempool-guide","target":"x86","runner":"ubuntu-latest"}]' || inputs.package == 'bitcoin-bip110' && '[{"package":"bitcoin-bip110","target":"x86","runner":"ubuntu-latest"}]' || '[{"package":"bitcoin-bip110","target":"x86","runner":"ubuntu-latest"},{"package":"mempool-guide","target":"x86","runner":"ubuntu-latest"}]') }}
 
     steps:
-      - name: Free disk space for the Bitcoin build
-        if: matrix.package == 'bitcoin-bip110'
+      - name: Free disk space for image builds
+        if: matrix.package == 'bitcoin-bip110' || matrix.package == 'mempool-guide'
         uses: Start9Labs/start-technologies/.github/actions/free-disk-space@master
 
       - name: Set up the StartOS build environment

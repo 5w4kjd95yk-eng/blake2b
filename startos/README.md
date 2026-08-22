@@ -1,12 +1,15 @@
-# BIP110 StartOS lab packages
+# StartOS packages
 
-This directory contains two StartOS SDK 2.0 packages:
+This directory contains three StartOS SDK 2.0 packages:
 
 - `bitcoin-bip110`: an isolated `pow_hf_blake2b` regtest node.
 - `datum-bip110`: the matching `bip110-pow-v2` DATUM gateway.
+- `mempool-guide`: the x86_64 mempool.guide/Retropex explorer, packaged under
+  a separate service id so it can coexist with Start9's official Mempool.
 
-They are a pair. Both are pinned to immutable source commits and verified
-tarball hashes. Both support x86_64 and aarch64 StartOS servers.
+The Bitcoin and DATUM packages are a pair and support x86_64 and aarch64. The
+Mempool Guide package is independent and currently targets x86_64 only. All
+three packages pin immutable source commits and verify source tarball hashes.
 
 They use Start SDK 2.0.9 and target StartOS 0.4.0-beta.10. A server still on
 the 0.3.5 generation must be upgraded before it can sideload these packages.
@@ -22,17 +25,15 @@ gateway supplies the height-20 BLAKE2b job to the external miner.
 ## Build remotely with GitHub Actions
 
 The repository workflow `.github/workflows/startos-packages.yml` builds all
-four installable artifacts on GitHub-hosted runners:
+installable artifacts on GitHub-hosted runners, including Mempool Guide for
+x86_64.
 
 - Bitcoin BIP110 for x86_64
-- Bitcoin BIP110 for aarch64
-- DATUM BIP110 for x86_64
-- DATUM BIP110 for aarch64
+- Mempool Guide for x86_64
 
-Push this repository to GitHub, open **Actions**, select **Build StartOS BIP110
-Packages**, and choose **Run workflow**. Download the two artifacts matching
-your StartOS server's architecture. You do not need Docker, CMake, or a C++
-toolchain on the Mac.
+Push this repository to GitHub, open **Actions**, select **Build StartOS
+Packages**, and choose **Run workflow**. Download the artifact for the package
+you want. You do not need Docker, CMake, or a C++ toolchain on the Mac.
 
 The workflow uses an ephemeral signing key because these are experimental
 sideload packages. It does not publish them to a registry.
