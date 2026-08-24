@@ -578,6 +578,7 @@ fn benchmark(config: &Config) -> Result<()> {
         id: "benchmark".to_owned(),
         blob: blob.to_vec(),
         target: Target::from_hex("00")?,
+        network_target: None,
         extra_nonce2: "0000000000000000".to_owned(),
         ntime: "0000000000000000".to_owned(),
     };
