@@ -90,6 +90,8 @@ pub fn run(config: Config) -> Result<()> {
     let stop_signal = Arc::clone(&stop);
     ctrlc::set_handler(move || stop_signal.store(true, Ordering::Release))
         .context("install Ctrl-C handler")?;
+    let stats_requested = Arc::new(AtomicBool::new(false));
+    install_stats_signal(Arc::clone(&stats_requested))?;
 
     let gpu_backend = if config.device.uses_gpu() {
         let backend = gpu::Miner::new(config.gpu_batch_size)?;
@@ -141,6 +143,7 @@ pub fn run(config: Config) -> Result<()> {
             &active_epoch,
             &hashes,
             &stop,
+            &stats_requested,
             &shares_rx,
             &mut best_share,
         ) {
@@ -161,6 +164,30 @@ pub fn run(config: Config) -> Result<()> {
     if gpu_failed.load(Ordering::Acquire) {
         bail!("Metal GPU worker failed");
     }
+    Ok(())
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn install_stats_signal(stats_requested: Arc<AtomicBool>) -> Result<()> {
+    signal_hook::flag::register(libc::SIGINFO, stats_requested)
+        .context("install SIGINFO handler")?;
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn install_stats_signal(_stats_requested: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
@@ -298,6 +325,7 @@ fn run_session(
     active_epoch: &AtomicU64,
     hashes: &HashCounters,
     stop: &AtomicBool,
+    stats_requested: &AtomicBool,
     shares: &Receiver<Share>,
     best_share: &mut Option<BestShare>,
 ) -> Result<()> {
@@ -362,10 +390,12 @@ fn run_session(
             Err(error) => return Err(error).context("read Stratum connection"),
         }
 
-        if last_stats.elapsed() >= config.stats_interval {
+        if stats_requested.swap(false, Ordering::AcqRel)
+            || last_stats.elapsed() >= config.stats_interval
+        {
             let now = Instant::now();
             let (cpu, gpu) = hashes.snapshot();
-            let seconds = now.duration_since(last_stats).as_secs_f64();
+            let seconds = now.duration_since(last_stats).as_secs_f64().max(1e-9);
             let cpu_rate = cpu.saturating_sub(last_cpu) as f64 / seconds;
             let gpu_rate = gpu.saturating_sub(last_gpu) as f64 / seconds;
             let total_rate = cpu_rate + gpu_rate;
@@ -723,6 +753,23 @@ mod tests {
     use std::net::TcpListener;
 
     use super::*;
+
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    #[test]
+    fn siginfo_requests_stats() {
+        let stats_requested = Arc::new(AtomicBool::new(false));
+        install_stats_signal(Arc::clone(&stats_requested)).unwrap();
+
+        signal_hook::low_level::raise(libc::SIGINFO).unwrap();
+
+        assert!(stats_requested.load(Ordering::Acquire));
+    }
 
     #[test]
     fn socks5_proxy_resolves_destination_hostname() {
