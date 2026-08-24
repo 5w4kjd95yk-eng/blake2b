@@ -326,3 +326,106 @@ pub fn backend(index: usize, batch_size: u32) -> anyhow::Result<Box<dyn super::B
         imp::backend(index, batch_size)
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::imp::{devices, CudaBackend};
+    use crate::{gpu::Backend, hash::blake2b256, protocol::JobSpec, target::Target};
+
+    const TEST_NONCES: u32 = 32;
+
+    #[test]
+    fn datum_kernel_matches_rust_at_full_nonce_boundaries() {
+        let Ok(available) = devices() else {
+            eprintln!("skipping CUDA self-test because the CUDA driver is unavailable");
+            return;
+        };
+        let Some(device) = available.first() else {
+            eprintln!("skipping CUDA self-test because no NVIDIA GPU is exposed");
+            return;
+        };
+
+        let starts = [
+            0,
+            u32::MAX as u64 - 15,
+            (1u64 << 32) + 0x1234_5678,
+            u64::MAX - 15,
+        ];
+        let mut random = 0x6a09_e667_f3bc_c908u64;
+        for (case, start_nonce) in starts.into_iter().enumerate() {
+            let mut blob = [0u8; 80];
+            for chunk in blob.chunks_exact_mut(8) {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                chunk.copy_from_slice(&random.to_le_bytes());
+            }
+            let hashes = (0..TEST_NONCES)
+                .map(|offset| {
+                    let nonce = start_nonce.wrapping_add(u64::from(offset));
+                    (nonce, reference_hash(blob, nonce))
+                })
+                .collect::<Vec<_>>();
+            // Selecting an observed prefix explicitly exercises <= equality.
+            let mut prefixes = hashes
+                .iter()
+                .map(|(nonce, hash)| (*nonce, u64::from_be_bytes(hash[..8].try_into().unwrap())))
+                .collect::<Vec<_>>();
+            prefixes.sort_unstable_by_key(|(_, prefix)| *prefix);
+            let (equal_nonce, selected_prefix) = prefixes[TEST_NONCES as usize / 2];
+            let target =
+                Target::from_hex(&format!("{selected_prefix:016x}{}", "00".repeat(24))).unwrap();
+            let spec = job(blob, target);
+            let mut backend = CudaBackend::new(device.index, TEST_NONCES).unwrap();
+            let prepared = backend.prepare_job(&spec, case as u64 + 1).unwrap();
+            let mut actual = backend.mine(prepared.as_ref(), start_nonce).unwrap();
+            let mut expected = hashes
+                .iter()
+                .filter_map(|(nonce, hash)| {
+                    let prefix = u64::from_be_bytes(hash[..8].try_into().unwrap());
+                    (prefix <= selected_prefix).then_some(*nonce)
+                })
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "CUDA mismatch in boundary case {case}");
+            assert!(actual.contains(&equal_nonce), "prefix equality was lost");
+            assert!(
+                hashes.iter().any(|(nonce, _)| !actual.contains(nonce)),
+                "self-test target did not select a non-candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn datum_kernel_reports_result_overflow() {
+        let Ok(available) = devices() else {
+            eprintln!("skipping CUDA overflow test because the CUDA driver is unavailable");
+            return;
+        };
+        let Some(device) = available.first() else {
+            eprintln!("skipping CUDA overflow test because no NVIDIA GPU is exposed");
+            return;
+        };
+        let spec = job([0x5a; 80], Target::from_hex(&"ff".repeat(32)).unwrap());
+        let mut backend = CudaBackend::new(device.index, 257).unwrap();
+        let prepared = backend.prepare_job(&spec, 99).unwrap();
+        let error = backend.mine(prepared.as_ref(), 0).unwrap_err();
+        assert!(error.to_string().contains("result buffer overflow"));
+    }
+
+    fn job(blob: [u8; 80], target: Target) -> JobSpec {
+        JobSpec {
+            id: "cuda-self-test".to_owned(),
+            blob: blob.to_vec(),
+            target,
+            extra_nonce2: "0000000000000000".to_owned(),
+            ntime: "0000000000000000".to_owned(),
+        }
+    }
+
+    fn reference_hash(mut blob: [u8; 80], nonce: u64) -> [u8; 32] {
+        blob[32..40].copy_from_slice(&nonce.to_le_bytes());
+        blake2b256(&blob)
+    }
+}
