@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf, str::FromStr, time::Duration};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use percent_encoding::percent_decode_str;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use url::Url;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
@@ -22,6 +22,79 @@ impl DeviceMode {
 
     pub fn uses_gpu(self) -> bool {
         matches!(self, Self::Gpu | Self::Both)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuBackend {
+    #[default]
+    Auto,
+    Metal,
+    Cuda,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GpuDevices {
+    All,
+    Indices(Vec<usize>),
+}
+
+impl Default for GpuDevices {
+    fn default() -> Self {
+        Self::Indices(vec![0])
+    }
+}
+
+impl FromStr for GpuDevices {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        if raw.eq_ignore_ascii_case("all") {
+            return Ok(Self::All);
+        }
+        let indices = raw
+            .split(',')
+            .map(|value| {
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid GPU device index {value:?}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if indices.is_empty() {
+            bail!("gpu_devices must be an index, a comma-separated list, or all");
+        }
+        if indices.iter().enumerate().any(|(position, index)| {
+            indices[..position].contains(index)
+        }) {
+            bail!("gpu_devices must not contain duplicate indices");
+        }
+        Ok(Self::Indices(indices))
+    }
+}
+
+impl<'de> Deserialize<'de> for GpuDevices {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Value {
+            Index(usize),
+            Indices(Vec<usize>),
+            Text(String),
+        }
+
+        match Value::deserialize(deserializer)? {
+            Value::Index(index) => Ok(Self::Indices(vec![index])),
+            Value::Indices(indices) if indices.is_empty() => {
+                Err(de::Error::custom("gpu_devices list must not be empty"))
+            }
+            Value::Indices(indices) => Ok(Self::Indices(indices)),
+            Value::Text(text) => text.parse().map_err(de::Error::custom),
+        }
     }
 }
 
@@ -54,6 +127,14 @@ pub struct Args {
     #[arg(long, value_enum)]
     pub device: Option<DeviceMode>,
 
+    /// GPU implementation: auto, metal, or cuda.
+    #[arg(long, value_enum)]
+    pub gpu_backend: Option<GpuBackend>,
+
+    /// GPU index, comma-separated indices, or all.
+    #[arg(long)]
+    pub gpu_devices: Option<GpuDevices>,
+
     /// Nonces dispatched in each Metal command buffer.
     #[arg(long)]
     pub gpu_batch_size: Option<u32>,
@@ -61,6 +142,10 @@ pub struct Args {
     /// Hash locally instead of connecting to a pool.
     #[arg(long)]
     pub benchmark: bool,
+
+    /// List usable GPU devices and exit without connecting to Stratum.
+    #[arg(long)]
+    pub list_devices: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -72,6 +157,8 @@ struct FileConfig {
     password: Option<String>,
     threads: Option<usize>,
     device: Option<DeviceMode>,
+    gpu_backend: Option<GpuBackend>,
+    gpu_devices: Option<GpuDevices>,
     gpu_batch_size: Option<u32>,
     reconnect_delay_seconds: Option<u64>,
     stats_interval_seconds: Option<u64>,
@@ -85,10 +172,13 @@ pub struct Config {
     pub password: String,
     pub threads: usize,
     pub device: DeviceMode,
+    pub gpu_backend: GpuBackend,
+    pub gpu_devices: GpuDevices,
     pub gpu_batch_size: u32,
     pub reconnect_delay: Duration,
     pub stats_interval: Duration,
     pub benchmark: bool,
+    pub list_devices: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,7 +200,7 @@ pub fn load(args: Args) -> Result<Config> {
             .with_context(|| format!("read {}", args.config.display()))?;
         serde_yml::from_str::<FileConfig>(&contents)
             .with_context(|| format!("parse {}", args.config.display()))?
-    } else if args.stratum_url.is_some() || args.benchmark {
+    } else if args.stratum_url.is_some() || args.benchmark || args.list_devices {
         FileConfig::default()
     } else {
         bail!(
@@ -120,6 +210,8 @@ pub fn load(args: Args) -> Result<Config> {
     };
 
     let device = args.device.or(file.device).unwrap_or_default();
+    let gpu_backend = args.gpu_backend.or(file.gpu_backend).unwrap_or_default();
+    let gpu_devices = args.gpu_devices.or(file.gpu_devices).unwrap_or_default();
     let raw_url = args
         .stratum_url
         .or(file.stratum_url)
@@ -166,10 +258,13 @@ pub fn load(args: Args) -> Result<Config> {
         password,
         threads,
         device,
+        gpu_backend,
+        gpu_devices,
         gpu_batch_size,
         reconnect_delay: Duration::from_secs(file.reconnect_delay_seconds.unwrap_or(5)),
         stats_interval: Duration::from_secs(file.stats_interval_seconds.unwrap_or(5).max(1)),
         benchmark: args.benchmark,
+        list_devices: args.list_devices,
     })
 }
 
@@ -304,5 +399,33 @@ mod tests {
         let config = load(args).unwrap();
 
         assert_eq!(config.threads, 4);
+    }
+
+    #[test]
+    fn parses_gpu_backend_and_device_selection() {
+        let args = Args::try_parse_from([
+            "miner",
+            "--list-devices",
+            "--config=missing-test-config.yaml",
+            "--gpu-backend=cuda",
+            "--gpu-devices=0,2",
+        ])
+        .unwrap();
+        let config = load(args).unwrap();
+
+        assert_eq!(config.gpu_backend, GpuBackend::Cuda);
+        assert_eq!(config.gpu_devices, GpuDevices::Indices(vec![0, 2]));
+        assert!(config.list_devices);
+    }
+
+    #[test]
+    fn file_gpu_devices_accepts_index_list_and_all() {
+        let one: FileConfig = serde_yml::from_str("gpu_devices: 2").unwrap();
+        let list: FileConfig = serde_yml::from_str("gpu_devices: [0, 3]").unwrap();
+        let all: FileConfig = serde_yml::from_str("gpu_devices: all").unwrap();
+
+        assert_eq!(one.gpu_devices, Some(GpuDevices::Indices(vec![2])));
+        assert_eq!(list.gpu_devices, Some(GpuDevices::Indices(vec![0, 3])));
+        assert_eq!(all.gpu_devices, Some(GpuDevices::All));
     }
 }

@@ -7,8 +7,9 @@ CPU and GPU workers reserve disjoint nonce ranges from the same job.
 
 The GPU worker uses a backend-neutral synchronous interface for device
 identity, job preparation, batch dispatch, and candidate collection. Metal is
-the only implemented backend for now; CUDA support is being developed as an
-opt-in backend and is not required by the default macOS build. Sprint 1
+the production hashing backend for now. CUDA device discovery and lifecycle
+support are available behind an opt-in feature; the CUDA hashing kernel arrives
+in Sprint 3. CUDA is not required by default builds. Sprint 1
 baseline and acceptance results are recorded in
 [`docs/cuda-sprint-1.md`](docs/cuda-sprint-1.md).
 
@@ -22,6 +23,16 @@ in the hash loop.
 cargo build --release
 ```
 
+CUDA-enabled Linux builds require a CUDA toolkit with `nvcc`:
+
+```sh
+cargo build --release --features cuda
+```
+
+`CUDA_PATH` (or `CUDA_HOME`) overrides the toolkit root. Fleet builds can set
+`CUDA_ARCHITECTURES` to a comma-separated compute capability list, for example
+`75,86,89`. The default is `75,80,86,89`.
+
 ## Configuration
 
 Edit `config.yaml`:
@@ -33,6 +44,8 @@ username: "wallet.worker"
 password: "x"
 threads: 0 # automatic; Datum both-mode reserves one logical CPU for Metal
 device: both # cpu, gpu, or both
+gpu_backend: auto # auto, metal, or cuda
+gpu_devices: all # one index, a YAML list such as [0, 2], or all
 gpu_batch_size: 1048576 # use 16777216 for balanced M4 Datum throughput
 
 reconnect_delay_seconds: 5
@@ -80,6 +93,17 @@ target/release/blake2b-miner --device cpu
 target/release/blake2b-miner --device gpu
 target/release/blake2b-miner --device both
 ```
+
+Inventory GPUs without loading the Stratum configuration or connecting to a
+gateway:
+
+```sh
+target/release/blake2b-miner --list-devices --gpu-backend cuda
+```
+
+On macOS, `auto` selects Metal. On Linux, it selects CUDA only in a
+CUDA-enabled build with an available NVIDIA device. Explicitly unavailable
+backends fail before workers or a Stratum session are started.
 
 Run a three-second local benchmark without connecting to a pool:
 

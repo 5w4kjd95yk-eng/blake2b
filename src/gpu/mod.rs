@@ -1,9 +1,13 @@
 use std::any::Any;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
-use crate::protocol::JobSpec;
+use crate::{
+    config::{GpuBackend, GpuDevices},
+    protocol::JobSpec,
+};
 
+mod cuda;
 mod metal;
 
 /// Identity shared by every GPU backend.
@@ -12,6 +16,9 @@ pub struct DeviceInfo {
     pub backend: &'static str,
     pub index: usize,
     pub name: String,
+    pub compute_capability: Option<(u32, u32)>,
+    pub total_memory: Option<u64>,
+    pub usable_memory: Option<u64>,
 }
 
 /// A job in the backend's native representation.
@@ -37,8 +44,69 @@ pub trait Backend: Send {
     fn mine(&mut self, job: &dyn PreparedJob, start_nonce: u64) -> Result<Vec<u64>>;
 }
 
-pub fn default_backend(batch_size: u32) -> Result<Box<dyn Backend>> {
-    Ok(Box::new(metal::MetalBackend::new(batch_size)?))
+pub fn devices(requested: GpuBackend) -> Result<Vec<DeviceInfo>> {
+    match resolve_backend(requested)? {
+        GpuBackend::Metal => {
+            let backend = metal::MetalBackend::new(1)?;
+            Ok(vec![backend.device_info().clone()])
+        }
+        GpuBackend::Cuda => cuda::devices(),
+        GpuBackend::Auto => unreachable!(),
+    }
+}
+
+pub fn backends(
+    requested: GpuBackend,
+    selected: &GpuDevices,
+    batch_size: u32,
+) -> Result<Vec<Box<dyn Backend>>> {
+    match resolve_backend(requested)? {
+        GpuBackend::Metal => {
+            let indices = selected_indices(selected, 1)?;
+            if indices != [0] {
+                bail!("Metal exposes only GPU device index 0");
+            }
+            Ok(vec![Box::new(metal::MetalBackend::new(batch_size)?)])
+        }
+        GpuBackend::Cuda => {
+            let available = cuda::devices()?;
+            selected_indices(selected, available.len())?
+                .into_iter()
+                .map(|index| cuda::backend(index, batch_size))
+                .collect()
+        }
+        GpuBackend::Auto => unreachable!(),
+    }
+}
+
+fn resolve_backend(requested: GpuBackend) -> Result<GpuBackend> {
+    match requested {
+        GpuBackend::Auto if cfg!(target_os = "macos") => Ok(GpuBackend::Metal),
+        GpuBackend::Auto if cfg!(all(target_os = "linux", feature = "cuda")) => {
+            if cuda::devices()?.is_empty() {
+                bail!("no NVIDIA CUDA devices are available");
+            }
+            Ok(GpuBackend::Cuda)
+        }
+        GpuBackend::Auto => bail!(
+            "no automatic GPU backend is available on this build; choose CPU or rebuild with CUDA"
+        ),
+        backend => Ok(backend),
+    }
+}
+
+fn selected_indices(selected: &GpuDevices, count: usize) -> Result<Vec<usize>> {
+    let indices = match selected {
+        GpuDevices::All => (0..count).collect(),
+        GpuDevices::Indices(indices) => indices.clone(),
+    };
+    if indices.is_empty() {
+        bail!("no GPU devices are available");
+    }
+    if let Some(index) = indices.iter().find(|index| **index >= count) {
+        bail!("GPU device index {index} does not exist (found {count} devices)");
+    }
+    Ok(indices)
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -52,7 +120,9 @@ mod tests {
 
     #[test]
     fn metal_matches_reference_for_datum_layout() {
-        let Ok(mut backend) = default_backend(1_024) else {
+        let Ok(mut backend) = backends(GpuBackend::Metal, &GpuDevices::default(), 1_024)
+            .map(|mut backends| backends.remove(0))
+        else {
             eprintln!("skipping Metal test because no GPU is exposed");
             return;
         };

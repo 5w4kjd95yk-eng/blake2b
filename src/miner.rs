@@ -76,6 +76,9 @@ struct WorkerContext {
 }
 
 pub fn run(config: Config) -> Result<()> {
+    if config.list_devices {
+        return list_devices(&config);
+    }
     if config.benchmark {
         return benchmark(&config);
     }
@@ -85,12 +88,18 @@ pub fn run(config: Config) -> Result<()> {
     ctrlc::set_handler(move || stop_signal.store(true, Ordering::Release))
         .context("install Ctrl-C handler")?;
 
-    let gpu_backend = if config.device.uses_gpu() {
-        let backend = gpu::default_backend(config.gpu_batch_size)?;
-        log_gpu_backend(backend.as_ref());
-        Some(backend)
+    let gpu_backends = if config.device.uses_gpu() {
+        let backends = gpu::backends(
+            config.gpu_backend,
+            &config.gpu_devices,
+            config.gpu_batch_size,
+        )?;
+        for backend in &backends {
+            log_gpu_backend(backend.as_ref());
+        }
+        backends
     } else {
-        None
+        Vec::new()
     };
     let current = Arc::new(ArcSwapOption::<Work>::empty());
     let active_epoch = Arc::new(AtomicU64::new(0));
@@ -99,7 +108,7 @@ pub fn run(config: Config) -> Result<()> {
     let (shares_tx, shares_rx) = unbounded();
     let workers = spawn_workers(
         &config,
-        gpu_backend,
+        gpu_backends,
         WorkerContext {
             current: Arc::clone(&current),
             active_epoch: Arc::clone(&active_epoch),
@@ -162,9 +171,34 @@ fn log_gpu_backend(backend: &dyn gpu::Backend) {
     );
 }
 
+fn list_devices(config: &Config) -> Result<()> {
+    for device in gpu::devices(config.gpu_backend)? {
+        let compute = device
+            .compute_capability
+            .map(|(major, minor)| format!(" compute={major}.{minor}"))
+            .unwrap_or_default();
+        let memory = device
+            .usable_memory
+            .zip(device.total_memory)
+            .map(|(usable, total)| {
+                format!(
+                    " memory_usable={}MiB memory_total={}MiB",
+                    usable / 1_048_576,
+                    total / 1_048_576
+                )
+            })
+            .unwrap_or_default();
+        println!(
+            "backend={} index={} name={}{}{}",
+            device.backend, device.index, device.name, compute, memory
+        );
+    }
+    Ok(())
+}
+
 fn spawn_workers(
     config: &Config,
-    gpu_backend: Option<Box<dyn gpu::Backend>>,
+    gpu_backends: Vec<Box<dyn gpu::Backend>>,
     context: WorkerContext,
 ) -> Result<Vec<thread::JoinHandle<()>>> {
     let mut workers = Vec::new();
@@ -178,7 +212,7 @@ fn spawn_workers(
             workers.push(worker);
         }
     }
-    if let Some(gpu_backend) = gpu_backend {
+    for gpu_backend in gpu_backends {
         let device = gpu_backend.device_info().clone();
         let context = context.clone();
         let worker = thread::Builder::new()
@@ -598,16 +632,22 @@ fn benchmark(config: &Config) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let gpu_failed = Arc::new(AtomicBool::new(false));
     let (shares, _unused_receiver) = unbounded();
-    let gpu_backend = if config.device.uses_gpu() {
-        let backend = gpu::default_backend(config.gpu_batch_size)?;
-        log_gpu_backend(backend.as_ref());
-        Some(backend)
+    let gpu_backends = if config.device.uses_gpu() {
+        let backends = gpu::backends(
+            config.gpu_backend,
+            &config.gpu_devices,
+            config.gpu_batch_size,
+        )?;
+        for backend in &backends {
+            log_gpu_backend(backend.as_ref());
+        }
+        backends
     } else {
-        None
+        Vec::new()
     };
     let workers = spawn_workers(
         config,
-        gpu_backend,
+        gpu_backends,
         WorkerContext {
             current: Arc::clone(&current),
             active_epoch: Arc::clone(&active_epoch),

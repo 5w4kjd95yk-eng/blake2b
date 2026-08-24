@@ -38,6 +38,9 @@ fn main() {
         .arg(&library)
         .arg("native/cuda_runtime.cu")
         .arg("-std=c++14")
+        // glibc 2.43 exposes C23 rsqrt declarations under _GNU_SOURCE that
+        // conflict with CUDA 13.1's device declarations.
+        .arg("-U_GNU_SOURCE")
         .arg("-Xcompiler=-fPIC");
     for architecture in architectures() {
         command.arg("-gencode").arg(format!(

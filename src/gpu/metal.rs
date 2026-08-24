@@ -82,6 +82,9 @@ mod imp {
                 backend: "Metal",
                 index: 0,
                 name: device.name().to_owned(),
+                compute_capability: None,
+                total_memory: None,
+                usable_memory: None,
             };
             let queue = device.new_command_queue();
             Ok(Self {
