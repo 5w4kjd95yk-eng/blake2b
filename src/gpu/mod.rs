@@ -91,15 +91,19 @@ pub fn backends(
 fn resolve_backend(requested: GpuBackend) -> Result<GpuBackend> {
     match requested {
         GpuBackend::Auto if cfg!(target_os = "macos") => Ok(GpuBackend::Metal),
-        GpuBackend::Auto if cfg!(all(target_os = "linux", feature = "cuda")) => {
-            if cuda::devices()?.is_empty() {
-                bail!("no NVIDIA CUDA devices are available");
+        GpuBackend::Auto => {
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            if cuda::devices().is_ok_and(|devices| !devices.is_empty()) {
+                return Ok(GpuBackend::Cuda);
             }
-            Ok(GpuBackend::Cuda)
+            #[cfg(feature = "opencl")]
+            if opencl::devices().is_ok_and(|devices| !devices.is_empty()) {
+                return Ok(GpuBackend::Opencl);
+            }
+            bail!(
+                "no automatic GPU backend is available; choose an explicit backend or rebuild with CUDA/OpenCL support"
+            )
         }
-        GpuBackend::Auto => bail!(
-            "no automatic GPU backend is available on this build; choose CPU or rebuild with CUDA"
-        ),
         backend => Ok(backend),
     }
 }

@@ -410,13 +410,13 @@ mod tests {
             "miner",
             "--list-devices",
             "--config=missing-test-config.yaml",
-            "--gpu-backend=cuda",
+            "--gpu-backend=opencl",
             "--gpu-devices=0,2",
         ])
         .unwrap();
         let config = load(args).unwrap();
 
-        assert_eq!(config.gpu_backend, GpuBackend::Cuda);
+        assert_eq!(config.gpu_backend, GpuBackend::Opencl);
         assert_eq!(config.gpu_devices, GpuDevices::Indices(vec![0, 2]));
         assert!(config.list_devices);
     }
