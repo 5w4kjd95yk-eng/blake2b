@@ -48,6 +48,12 @@ impl Work {
 struct Share {
     work: Arc<Work>,
     nonce: u64,
+    digest: [u8; 32],
+}
+
+struct BestShare {
+    hash: [u8; 32],
+    difficulty: f64,
 }
 
 #[derive(Default)]
@@ -97,6 +103,7 @@ pub fn run(config: Config) -> Result<()> {
     let hashes = Arc::new(HashCounters::default());
     let gpu_failed = Arc::new(AtomicBool::new(false));
     let (shares_tx, shares_rx) = unbounded();
+    let mut best_share = None;
     let workers = spawn_workers(
         &config,
         gpu_backend,
@@ -128,9 +135,15 @@ pub fn run(config: Config) -> Result<()> {
     );
 
     while !stop.load(Ordering::Acquire) {
-        if let Err(error) =
-            run_session(&config, &current, &active_epoch, &hashes, &stop, &shares_rx)
-        {
+        if let Err(error) = run_session(
+            &config,
+            &current,
+            &active_epoch,
+            &hashes,
+            &stop,
+            &shares_rx,
+            &mut best_share,
+        ) {
             current.store(None);
             active_epoch.fetch_add(1, Ordering::AcqRel);
             if !stop.load(Ordering::Acquire) {
@@ -215,12 +228,16 @@ fn worker_loop(context: WorkerContext) {
             let mask = work
                 .prepared
                 .datum_candidate_mask(nonce, work.spec.target.words_be());
-            for lane in 0..4 {
-                if mask & (1 << lane) != 0 {
-                    let _ = context.shares.send(Share {
-                        work: Arc::clone(&work),
-                        nonce: nonce.wrapping_add(lane as u64),
-                    });
+            if mask != 0 {
+                let digests = work.prepared.hash4(nonce);
+                for (lane, digest) in digests.iter().enumerate() {
+                    if mask & (1 << lane) != 0 {
+                        let _ = context.shares.send(Share {
+                            work: Arc::clone(&work),
+                            nonce: nonce.wrapping_add(lane as u64),
+                            digest: *digest,
+                        });
+                    }
                 }
             }
             offset += 4;
@@ -261,6 +278,7 @@ fn gpu_worker_loop(mut miner: gpu::Miner, context: &WorkerContext) -> Result<()>
             let _ = context.shares.send(Share {
                 work: Arc::clone(&work),
                 nonce,
+                digest,
             });
         }
     }
@@ -281,6 +299,7 @@ fn run_session(
     hashes: &HashCounters,
     stop: &AtomicBool,
     shares: &Receiver<Share>,
+    best_share: &mut Option<BestShare>,
 ) -> Result<()> {
     let stream = connect(&config.endpoint, config.socks5_proxy.as_ref())?;
     stream.set_nodelay(true)?;
@@ -314,6 +333,7 @@ fn run_session(
             if share.work.epoch != active_epoch.load(Ordering::Acquire) {
                 continue;
             }
+            observe_share(&share, best_share);
             let nonce = share.work.prepared.nonce_hex(share.nonce);
             let message = share
                 .work
@@ -349,13 +369,18 @@ fn run_session(
             let cpu_rate = cpu.saturating_sub(last_cpu) as f64 / seconds;
             let gpu_rate = gpu.saturating_sub(last_gpu) as f64 / seconds;
             let total_rate = cpu_rate + gpu_rate;
+            let best_share_display = best_share
+                .as_ref()
+                .map(|best| format_difficulty(best.difficulty))
+                .unwrap_or_else(|| "none".to_owned());
             eprintln!(
-                "{:.3} MH/s (cpu={:.3} gpu={:.3}) accepted={} rejected={} total_hashes={}",
+                "{:.3} MH/s (cpu={:.3} gpu={:.3}) accepted={} rejected={} best_share={} total_hashes={}",
                 total_rate / 1_000_000.0,
                 cpu_rate / 1_000_000.0,
                 gpu_rate / 1_000_000.0,
                 accepted,
                 rejected,
+                best_share_display,
                 cpu + gpu
             );
             last_cpu = cpu;
@@ -364,6 +389,66 @@ fn run_session(
         }
     }
     Ok(())
+}
+
+fn observe_share(share: &Share, best_share: &mut Option<BestShare>) {
+    let difficulty = Target::difficulty_for_hash(&share.digest);
+    let is_new_best = best_share
+        .as_ref()
+        .is_none_or(|best| share.digest < best.hash);
+    if is_new_best {
+        eprintln!(
+            "new best share: difficulty={} job={} nonce={} hash={}",
+            format_difficulty(difficulty),
+            share.work.spec.id,
+            share.work.prepared.nonce_hex(share.nonce),
+            hex::encode(share.digest)
+        );
+        *best_share = Some(BestShare {
+            hash: share.digest,
+            difficulty,
+        });
+    }
+
+    let Some(network_target) = &share.work.spec.network_target else {
+        return;
+    };
+    if network_target.accepts(&share.digest) {
+        eprintln!(
+            "********************************************************************************"
+        );
+        eprintln!(
+            "*** BLOCK CANDIDATE FOUND *** difficulty={} network_difficulty={} job={} nonce={} hash={}",
+            format_difficulty(difficulty),
+            format_difficulty(network_target.difficulty()),
+            share.work.spec.id,
+            share.work.prepared.nonce_hex(share.nonce),
+            hex::encode(share.digest)
+        );
+        eprintln!(
+            "********************************************************************************"
+        );
+    }
+}
+
+fn format_difficulty(difficulty: f64) -> String {
+    const UNITS: [(f64, &str); 6] = [
+        (1e18, "E"),
+        (1e15, "P"),
+        (1e12, "T"),
+        (1e9, "G"),
+        (1e6, "M"),
+        (1e3, "K"),
+    ];
+    if !difficulty.is_finite() {
+        return "inf".to_owned();
+    }
+    for (threshold, suffix) in UNITS {
+        if difficulty >= threshold {
+            return format!("{:.3}{suffix}", difficulty / threshold);
+        }
+    }
+    format!("{difficulty:.3}")
 }
 
 fn handle_message(
