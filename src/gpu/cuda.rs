@@ -419,6 +419,7 @@ mod tests {
             id: "cuda-self-test".to_owned(),
             blob: blob.to_vec(),
             target,
+            network_target: None,
             extra_nonce2: "0000000000000000".to_owned(),
             ntime: "0000000000000000".to_owned(),
         }

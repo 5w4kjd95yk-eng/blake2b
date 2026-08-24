@@ -88,6 +88,14 @@ target/release/blake2b-miner \
 
 `--device` overrides the YAML device. `threads` is ignored in GPU-only mode.
 
+The periodic console line includes `best_share`, the actual difficulty of the
+strongest qualifying share found since the process started. A new record prints
+its job, nonce, and hash immediately. The miner decodes the network target
+from each job's `nBits`; a hash meeting it produces a prominent
+`BLOCK CANDIDATE FOUND` message before the share is submitted. The gateway and
+node remain authoritative for whether that candidate is accepted and added to
+the chain.
+
 ```sh
 target/release/blake2b-miner --device cpu
 target/release/blake2b-miner --device gpu

@@ -8,6 +8,7 @@ pub struct JobSpec {
     pub id: String,
     pub blob: Vec<u8>,
     pub target: Target,
+    pub network_target: Option<Target>,
     pub extra_nonce2: String,
     pub ntime: String,
 }
@@ -78,6 +79,8 @@ impl SessionState {
             .target
             .clone()
             .context("DATUM job arrived before mining.set_difficulty or mining.set_target")?;
+        let network_target = Target::from_compact_hex(value_string(&params[6], "nbits")?)
+            .context("invalid DATUM network target")?;
         let id = value_string(&params[0], "job ID")?.to_owned();
         let previous = decode_exact(
             value_string(&params[1], "previous ASIC input")?,
@@ -134,6 +137,7 @@ impl SessionState {
             id,
             blob: header,
             target,
+            network_target: Some(network_target),
             extra_nonce2,
             ntime,
         })
@@ -221,6 +225,10 @@ mod tests {
         assert_eq!(&job.blob[32..40], &[0; 8]);
         assert_eq!(&job.blob[40..48], hex::decode("0102030405060708").unwrap());
         assert_eq!(&job.blob[48..], &[0x22; 32]);
+        assert_eq!(
+            job.network_target.as_ref(),
+            Some(&Target::from_compact_hex("207fffff").unwrap())
+        );
         assert_eq!(
             job.submission("local.worker", 10, "8877665544332211".to_owned())["params"],
             json!([
