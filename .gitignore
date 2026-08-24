@@ -1,3 +1,5 @@
 /target/
+config.yaml
+plan.md
 *.local.yaml
 .DS_Store
