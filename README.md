@@ -1,4 +1,4 @@
-# blake2b-apple-miner
+# blake2b-miner
 
 DATUM BIP-110 profile-0 Blake2b-256 Stratum miner. On Apple silicon, the CPU
 hot loop hashes four independent nonces at once using AArch64 NEON and the
@@ -57,7 +57,7 @@ community DATUM gateway forks. It accepts both the current DATUM job built from
 `extranonce2`:
 
 ```sh
-target/release/blake2b-apple-miner \
+target/release/blake2b-miner \
   --device both \
   --stratum-url=stratum+tcp://127.0.0.1:23334 \
   --username=local.worker \
@@ -67,7 +67,7 @@ target/release/blake2b-apple-miner \
 CLI values override YAML values. Either spelling of the URL flag works:
 
 ```sh
-target/release/blake2b-apple-miner \
+target/release/blake2b-miner \
   --startum-url=stratum+tcp://pool.acme.com:5575 \
   --username=wallet.worker \
   --password=x
@@ -76,15 +76,15 @@ target/release/blake2b-apple-miner \
 `--device` overrides the YAML device. `threads` is ignored in GPU-only mode.
 
 ```sh
-target/release/blake2b-apple-miner --device cpu
-target/release/blake2b-apple-miner --device gpu
-target/release/blake2b-apple-miner --device both
+target/release/blake2b-miner --device cpu
+target/release/blake2b-miner --device gpu
+target/release/blake2b-miner --device both
 ```
 
 Run a three-second local benchmark without connecting to a pool:
 
 ```sh
-target/release/blake2b-apple-miner --benchmark --device both
+target/release/blake2b-miner --benchmark --device both
 ```
 
 ## Wire format

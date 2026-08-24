@@ -89,7 +89,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "blake2b-apple-miner"
+name = "blake2b-miner"
 version = "0.1.0"
 dependencies = [
  "anyhow",

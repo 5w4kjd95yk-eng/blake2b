@@ -7,7 +7,7 @@ Open the service's Interfaces page and copy the BIP110 Stratum address. On the
 Mac that runs the miner, use:
 
 ```sh
-target/release/blake2b-apple-miner \
+target/release/blake2b-miner \
   --datum \
   --device both \
   --startum-url=stratum+tcp://STARTOS_ADDRESS:23334 \

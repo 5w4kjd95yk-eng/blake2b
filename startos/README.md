@@ -48,7 +48,7 @@ sideload packages. It does not publish them to a registry.
 5. On the Apple Silicon Mac, run:
 
    ```sh
-   target/release/blake2b-apple-miner \
+   target/release/blake2b-miner \
      --datum \
      --device both \
      --startum-url='stratum+tcp://ADDRESS_SHOWN_BY_STARTOS' \

@@ -154,7 +154,7 @@ impl SessionState {
 }
 
 pub fn subscribe_request() -> Value {
-    json!({"id": 1, "method": "mining.subscribe", "params": ["blake2b-apple-miner/0.1.0"]})
+    json!({"id": 1, "method": "mining.subscribe", "params": ["blake2b-miner/0.1.0"]})
 }
 
 pub fn authorize_request(username: &str, password: &str) -> Value {
