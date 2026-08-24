@@ -8,7 +8,9 @@ CPU and GPU workers reserve disjoint nonce ranges from the same job.
 The GPU worker uses a backend-neutral synchronous interface for device
 identity, job preparation, batch dispatch, and candidate collection. Metal is
 the only implemented backend for now; CUDA support is being developed as an
-opt-in backend and is not required by the default macOS build.
+opt-in backend and is not required by the default macOS build. Sprint 1
+baseline and acceptance results are recorded in
+[`docs/cuda-sprint-1.md`](docs/cuda-sprint-1.md).
 
 Rust fits this job. It exposes AArch64 intrinsics without requiring assembly,
 keeps the networking/configuration code memory-safe, and has no runtime or GC
