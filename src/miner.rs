@@ -15,10 +15,10 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde_json::Value;
 
 use crate::{
-    config::{ByteOrder, Config, Endpoint, Mode},
+    config::{Config, Endpoint},
     gpu,
     hash::PreparedBlock,
-    protocol::{self, JobSpec, SessionState, Submit},
+    protocol::{self, JobSpec, SessionState},
     target::Target,
 };
 
@@ -34,13 +34,8 @@ struct Work {
 
 impl Work {
     fn new(spec: JobSpec, epoch: u64) -> Result<Self> {
-        let prepared = PreparedBlock::new(
-            &spec.blob,
-            spec.nonce_offset,
-            spec.nonce_size,
-            spec.nonce_order == ByteOrder::Little,
-        )
-        .context("job cannot be prepared for one-block SIMD hashing")?;
+        let prepared = PreparedBlock::new(&spec.blob)
+            .context("job cannot be prepared for one-block SIMD hashing")?;
         Ok(Self {
             spec,
             prepared,
@@ -92,7 +87,7 @@ pub fn run(config: Config) -> Result<()> {
 
     let gpu_backend = if config.device.uses_gpu() {
         let backend = gpu::Miner::new(config.gpu_batch_size)?;
-        log_gpu_backend(&config, &backend);
+        log_gpu_backend(&backend);
         Some(backend)
     } else {
         None
@@ -116,12 +111,7 @@ pub fn run(config: Config) -> Result<()> {
     )?;
 
     eprintln!(
-        "mode={} device={:?} endpoint={}:{} cpu_threads={} simd={}",
-        match config.mode {
-            Mode::Sia => "sia",
-            Mode::Datum => "datum",
-            Mode::Normal => "normal",
-        },
+        "mode=datum device={:?} endpoint={}:{} cpu_threads={} simd={}",
         config.device,
         config.endpoint.host,
         config.endpoint.port,
@@ -161,20 +151,12 @@ pub fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
-fn log_gpu_backend(config: &Config, backend: &gpu::Miner) {
-    if config.mode == Mode::Datum {
-        eprintln!(
-            "Metal GPU: {} batch_size={} kernel=datum-split32 nonces/thread=4 threads/threadgroup=64",
-            backend.device_name(),
-            backend.batch_size()
-        );
-    } else {
-        eprintln!(
-            "Metal GPU: {} batch_size={} kernel=generic",
-            backend.device_name(),
-            backend.batch_size()
-        );
-    }
+fn log_gpu_backend(backend: &gpu::Miner) {
+    eprintln!(
+        "Metal GPU: {} batch_size={} kernel=datum-split32 nonces/thread=4 threads/threadgroup=64",
+        backend.device_name(),
+        backend.batch_size()
+    );
 }
 
 fn spawn_workers(
@@ -230,24 +212,11 @@ fn worker_loop(context: WorkerContext) {
             }
             let nonce = start.wrapping_add(offset);
             pending_hashes += 4;
-            if matches!(work.spec.submit, Submit::Datum { .. }) {
-                let mask = work
-                    .prepared
-                    .datum_candidate_mask(nonce, work.spec.target.words_be());
-                for lane in 0..4 {
-                    if mask & (1 << lane) != 0 {
-                        let _ = context.shares.send(Share {
-                            work: Arc::clone(&work),
-                            nonce: nonce.wrapping_add(lane as u64),
-                        });
-                    }
-                }
-            } else {
-                let digests = work.prepared.hash4(nonce);
-                for (lane, digest) in digests.iter().enumerate() {
-                    if !work.spec.target.accepts(digest, work.spec.hash_order) {
-                        continue;
-                    }
+            let mask = work
+                .prepared
+                .datum_candidate_mask(nonce, work.spec.target.words_be());
+            for lane in 0..4 {
+                if mask & (1 << lane) != 0 {
                     let _ = context.shares.send(Share {
                         work: Arc::clone(&work),
                         nonce: nonce.wrapping_add(lane as u64),
@@ -285,11 +254,9 @@ fn gpu_worker_loop(mut miner: gpu::Miner, context: &WorkerContext) -> Result<()>
             continue;
         }
         for nonce in winning_nonces {
-            if matches!(work.spec.submit, Submit::Datum { .. }) {
-                let digest = work.prepared.hash4(nonce)[0];
-                if !work.spec.target.accepts(&digest, work.spec.hash_order) {
-                    continue;
-                }
+            let digest = work.prepared.hash4(nonce)[0];
+            if !work.spec.target.accepts(&digest) {
+                continue;
             }
             let _ = context.shares.send(Share {
                 work: Arc::clone(&work),
@@ -364,7 +331,6 @@ fn run_session(
                     serde_json::from_str(&line).context("invalid JSON from pool")?;
                 handle_message(
                     message,
-                    config,
                     &mut session,
                     current,
                     active_epoch,
@@ -402,7 +368,6 @@ fn run_session(
 
 fn handle_message(
     message: Value,
-    config: &Config,
     session: &mut SessionState,
     current: &ArcSwapOption<Work>,
     active_epoch: &AtomicU64,
@@ -413,11 +378,11 @@ fn handle_message(
         let params = message.get("params").unwrap_or(&Value::Null);
         match method {
             "mining.notify" => {
-                let spec = session.parse_job(params, config)?;
+                let spec = session.parse_job(params)?;
                 install_work(spec, current, active_epoch)?;
             }
             "mining.set_target" | "mining.set_difficulty" => {
-                if session.apply_target(method, params, config.mode)? {
+                if session.apply_target(method, params)? {
                     if let (Some(work), Some(target)) =
                         (current.load_full(), session.target.clone())
                     {
@@ -426,8 +391,6 @@ fn handle_message(
                         install_work(spec, current, active_epoch)?;
                     }
                     eprintln!("share target updated");
-                } else {
-                    eprintln!("ignored mining.set_difficulty in --normal mode; send mining.set_target or a job target");
                 }
             }
             "client.reconnect" => bail!("pool requested reconnect"),
@@ -449,7 +412,7 @@ fn handle_message(
         bail!("Stratum request {id} failed: {error}");
     }
     match id {
-        1 => session.apply_subscribe_response(&message, config.mode),
+        1 => session.apply_subscribe_response(&message),
         2 if message.get("result") != Some(&Value::Bool(true)) => {
             bail!("pool rejected mining.authorize")
         }
@@ -611,34 +574,12 @@ fn interruptible_sleep(duration: Duration, stop: &AtomicBool) {
 
 fn benchmark(config: &Config) -> Result<()> {
     let blob = [0x5au8; 80];
-    let (offset, size, nonce_order, hash_order) = match config.mode {
-        Mode::Sia | Mode::Datum => (32, 8, ByteOrder::Little, ByteOrder::Big),
-        Mode::Normal => (
-            config.nonce_offset,
-            config.nonce_size,
-            config.nonce_endian,
-            config.hash_byte_order,
-        ),
-    };
     let spec = JobSpec {
         id: "benchmark".to_owned(),
         blob: blob.to_vec(),
         target: Target::from_hex("00")?,
-        nonce_offset: offset,
-        nonce_size: size,
-        nonce_order,
-        hash_order,
-        submit: match config.mode {
-            Mode::Datum => Submit::Datum {
-                extra_nonce2: "0000000000000000".to_owned(),
-                ntime: "00000000".to_owned(),
-            },
-            Mode::Sia => Submit::Sia {
-                extra_nonce2: String::new(),
-                ntime: "00000000".to_owned(),
-            },
-            Mode::Normal => Submit::Normal,
-        },
+        extra_nonce2: "0000000000000000".to_owned(),
+        ntime: "0000000000000000".to_owned(),
     };
     let current = Arc::new(ArcSwapOption::from(Some(Arc::new(Work::new(spec, 1)?))));
     let active_epoch = Arc::new(AtomicU64::new(1));
@@ -648,7 +589,7 @@ fn benchmark(config: &Config) -> Result<()> {
     let (shares, _unused_receiver) = unbounded();
     let gpu_backend = if config.device.uses_gpu() {
         let backend = gpu::Miner::new(config.gpu_batch_size)?;
-        log_gpu_backend(config, &backend);
+        log_gpu_backend(&backend);
         Some(backend)
     } else {
         None

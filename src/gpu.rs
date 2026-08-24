@@ -1,9 +1,6 @@
 use anyhow::{bail, Result};
 
-use crate::{
-    config::ByteOrder,
-    protocol::{JobSpec, Submit},
-};
+use crate::protocol::JobSpec;
 
 #[cfg(target_os = "macos")]
 const MAX_RESULTS: usize = 256;
@@ -13,29 +10,15 @@ const MAX_RESULTS: usize = 256;
 pub struct Job {
     words: [u64; 16],
     target: [u64; 4],
-    input_len: u32,
-    nonce_offset: u32,
-    nonce_size: u32,
-    nonce_little_endian: bool,
-    hash_little_endian: bool,
-    datum: bool,
 }
 
 impl Job {
     pub fn new(spec: &JobSpec) -> Result<Self> {
-        if spec.blob.len() > 128 {
+        if spec.blob.len() != 80 {
             bail!(
-                "Metal backend supports one Blake2b block, got {} bytes",
+                "DATUM Metal backend requires an 80-byte ASIC input, got {} bytes",
                 spec.blob.len()
             );
-        }
-        if !(1..=8).contains(&spec.nonce_size)
-            || spec
-                .nonce_offset
-                .checked_add(spec.nonce_size)
-                .is_none_or(|end| end > spec.blob.len())
-        {
-            bail!("GPU nonce layout does not fit the input blob");
         }
         let mut block = [0u8; 128];
         block[..spec.blob.len()].copy_from_slice(&spec.blob);
@@ -46,12 +29,6 @@ impl Job {
         Ok(Self {
             words,
             target: spec.target.words_be(),
-            input_len: spec.blob.len() as u32,
-            nonce_offset: spec.nonce_offset as u32,
-            nonce_size: spec.nonce_size as u32,
-            nonce_little_endian: spec.nonce_order == ByteOrder::Little,
-            hash_little_endian: spec.hash_order == ByteOrder::Little,
-            datum: matches!(spec.submit, Submit::Datum { .. }),
         })
     }
 }
@@ -76,11 +53,6 @@ mod imp {
         words: [u64; 16],
         start_nonce: u64,
         target: [u64; 4],
-        input_len: u32,
-        nonce_offset: u32,
-        nonce_size: u32,
-        nonce_little_endian: u32,
-        hash_little_endian: u32,
         max_results: u32,
         nonce_count: u32,
     }
@@ -88,8 +60,7 @@ mod imp {
     pub struct Miner {
         device_name: String,
         queue: CommandQueue,
-        generic_pipeline: ComputePipelineState,
-        datum_pipeline: ComputePipelineState,
+        pipeline: ComputePipelineState,
         job_buffer: Buffer,
         count_buffer: Buffer,
         result_buffer: Buffer,
@@ -103,17 +74,11 @@ mod imp {
             let library = device
                 .new_library_with_source(SHADER, &options)
                 .map_err(|error| anyhow::anyhow!("compile Metal Blake2b kernel: {error}"))?;
-            let generic_function = library
-                .get_function("blake2b_mine", None)
-                .map_err(|error| anyhow::anyhow!("load Metal Blake2b kernel: {error}"))?;
-            let generic_pipeline = device
-                .new_compute_pipeline_state_with_function(&generic_function)
-                .map_err(|error| anyhow::anyhow!("create Metal compute pipeline: {error}"))?;
-            let datum_function = library
+            let function = library
                 .get_function("blake2b_datum_mine", None)
                 .map_err(|error| anyhow::anyhow!("load Metal Datum kernel: {error}"))?;
-            let datum_pipeline = device
-                .new_compute_pipeline_state_with_function(&datum_function)
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&function)
                 .map_err(|error| anyhow::anyhow!("create Metal Datum pipeline: {error}"))?;
             let shared = MTLResourceOptions::StorageModeShared;
             let job_buffer = device.new_buffer(mem::size_of::<JobParams>() as u64, shared);
@@ -125,8 +90,7 @@ mod imp {
             Ok(Self {
                 device_name,
                 queue,
-                generic_pipeline,
-                datum_pipeline,
+                pipeline,
                 job_buffer,
                 count_buffer,
                 result_buffer,
@@ -151,11 +115,6 @@ mod imp {
                 words: job.words,
                 start_nonce,
                 target: job.target,
-                input_len: job.input_len,
-                nonce_offset: job.nonce_offset,
-                nonce_size: job.nonce_size,
-                nonce_little_endian: u32::from(job.nonce_little_endian),
-                hash_little_endian: u32::from(job.hash_little_endian),
                 max_results: MAX_RESULTS as u32,
                 nonce_count: self.batch_size,
             };
@@ -170,29 +129,12 @@ mod imp {
 
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            let pipeline = if job.datum {
-                &self.datum_pipeline
-            } else {
-                &self.generic_pipeline
-            };
-            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_compute_pipeline_state(&self.pipeline);
             encoder.set_buffer(0, Some(&self.job_buffer), 0);
             encoder.set_buffer(1, Some(&self.count_buffer), 0);
             encoder.set_buffer(2, Some(&self.result_buffer), 0);
-            let execution_width = pipeline.thread_execution_width();
-            let group_width = if job.datum {
-                64
-            } else {
-                pipeline
-                    .max_total_threads_per_threadgroup()
-                    .min(256)
-                    .max(execution_width)
-            };
-            let thread_count = if job.datum {
-                u64::from(self.batch_size).div_ceil(4)
-            } else {
-                u64::from(self.batch_size)
-            };
+            let group_width = 64;
+            let thread_count = u64::from(self.batch_size).div_ceil(4);
             encoder.dispatch_threads(
                 MTLSize::new(thread_count, 1, 1),
                 MTLSize::new(group_width, 1, 1),
@@ -256,114 +198,37 @@ mod tests {
     use blake2::{digest::consts::U32, Blake2b, Digest};
 
     use super::*;
-    use crate::{
-        config::ByteOrder,
-        protocol::{JobSpec, Submit},
-        target::Target,
-    };
+    use crate::{protocol::JobSpec, target::Target};
 
     type ReferenceBlake2b256 = Blake2b<U32>;
 
-    struct TestLayout {
-        blob: Vec<u8>,
-        nonce_offset: usize,
-        nonce_size: usize,
-        nonce_order: ByteOrder,
-        hash_order: ByteOrder,
-        start_nonce: u64,
-        submit: Submit,
-    }
-
     #[test]
-    fn metal_matches_reference_for_sia_and_raw_layouts() {
+    fn metal_matches_reference_for_datum_layout() {
         let Ok(mut miner) = Miner::new(1_024) else {
             eprintln!("skipping Metal test because no GPU is exposed");
             return;
         };
-
-        verify_layout(
-            &mut miner,
-            TestLayout {
-                blob: vec![0x5a; 80],
-                nonce_offset: 32,
-                nonce_size: 8,
-                nonce_order: ByteOrder::Little,
-                hash_order: ByteOrder::Big,
-                start_nonce: 10_000,
-                submit: Submit::Normal,
-            },
-        );
-        verify_layout(
-            &mut miner,
-            TestLayout {
-                blob: vec![0x5a; 80],
-                nonce_offset: 32,
-                nonce_size: 8,
-                nonce_order: ByteOrder::Little,
-                hash_order: ByteOrder::Big,
-                start_nonce: u32::MAX as u64 - 511,
-                submit: Submit::Datum {
-                    extra_nonce2: "0000000000000000".to_owned(),
-                    ntime: "00000000".to_owned(),
-                },
-            },
-        );
-        verify_layout(
-            &mut miner,
-            TestLayout {
-                blob: vec![0xa5; 96],
-                nonce_offset: 7,
-                nonce_size: 4,
-                nonce_order: ByteOrder::Big,
-                hash_order: ByteOrder::Little,
-                start_nonce: 0x0102_0304,
-                submit: Submit::Normal,
-            },
-        );
-    }
-
-    fn verify_layout(miner: &mut Miner, layout: TestLayout) {
-        let TestLayout {
-            blob,
-            nonce_offset,
-            nonce_size,
-            nonce_order,
-            hash_order,
-            start_nonce,
-            submit,
-        } = layout;
+        let blob = vec![0x5a; 80];
+        let start_nonce = u32::MAX as u64 - 511;
         let mut hashes = (0..miner.batch_size())
             .map(|offset| {
                 let nonce = start_nonce + u64::from(offset);
-                (
-                    nonce,
-                    reference_hash(&blob, nonce_offset, nonce_size, nonce_order, nonce),
-                )
+                (nonce, reference_hash(&blob, nonce))
             })
             .collect::<Vec<_>>();
-        hashes.sort_unstable_by(|(_, left), (_, right)| match hash_order {
-            ByteOrder::Big => left.cmp(right),
-            ByteOrder::Little => left.iter().rev().cmp(right.iter().rev()),
-        });
+        hashes.sort_unstable_by_key(|(_, hash)| *hash);
         let selected = hashes[31].1;
-        let target_bytes = match hash_order {
-            ByteOrder::Big => selected.to_vec(),
-            ByteOrder::Little => selected.iter().rev().copied().collect(),
-        };
-        let target = Target::from_hex(&hex::encode(target_bytes)).unwrap();
+        let target = Target::from_hex(&hex::encode(selected)).unwrap();
         let spec = JobSpec {
             id: "gpu-test".to_owned(),
             blob,
             target: target.clone(),
-            nonce_offset,
-            nonce_size,
-            nonce_order,
-            hash_order,
-            submit,
+            extra_nonce2: "0000000000000000".to_owned(),
+            ntime: "0000000000000000".to_owned(),
         };
         let mut expected = hashes
             .iter()
-            .filter_map(|(nonce, hash)| target.accepts(hash, hash_order).then_some(*nonce))
+            .filter_map(|(nonce, hash)| target.accepts(hash).then_some(*nonce))
             .collect::<Vec<_>>();
         let mut actual = miner.mine(&Job::new(&spec).unwrap(), start_nonce).unwrap();
         expected.sort_unstable();
@@ -371,23 +236,9 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    fn reference_hash(
-        blob: &[u8],
-        nonce_offset: usize,
-        nonce_size: usize,
-        nonce_order: ByteOrder,
-        nonce: u64,
-    ) -> [u8; 32] {
+    fn reference_hash(blob: &[u8], nonce: u64) -> [u8; 32] {
         let mut input = blob.to_vec();
-        let bytes = match nonce_order {
-            ByteOrder::Little => nonce.to_le_bytes(),
-            ByteOrder::Big => nonce.to_be_bytes(),
-        };
-        let source = match nonce_order {
-            ByteOrder::Little => &bytes[..nonce_size],
-            ByteOrder::Big => &bytes[8 - nonce_size..],
-        };
-        input[nonce_offset..nonce_offset + nonce_size].copy_from_slice(source);
+        input[32..40].copy_from_slice(&nonce.to_le_bytes());
         ReferenceBlake2b256::digest(input).into()
     }
 }

@@ -4,8 +4,6 @@ use anyhow::{bail, Context, Result};
 use num_bigint::BigUint;
 use num_traits::Zero;
 
-use crate::config::ByteOrder;
-
 #[derive(Clone, PartialEq, Eq)]
 pub struct Target([u8; 32]);
 
@@ -47,12 +45,8 @@ impl Target {
     }
 
     #[inline]
-    pub fn accepts(&self, digest: &[u8; 32], order: ByteOrder) -> bool {
-        let ordering = match order {
-            ByteOrder::Big => digest.as_slice().cmp(&self.0),
-            ByteOrder::Little => digest.iter().rev().cmp(self.0.iter()),
-        };
-        ordering != Ordering::Greater
+    pub fn accepts(&self, digest: &[u8; 32]) -> bool {
+        digest.as_slice().cmp(&self.0) != Ordering::Greater
     }
 
     pub fn as_hex(&self) -> String {
@@ -108,7 +102,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn computes_sia_stratum_difficulty_one_target() {
+    fn computes_stratum_difficulty_one_target() {
         let target = Target::from_stratum_difficulty("1").unwrap();
         assert_eq!(
             target.as_hex(),
@@ -125,14 +119,10 @@ mod tests {
     }
 
     #[test]
-    fn compares_hashes_in_both_orders() {
+    fn compares_big_endian_hashes() {
         let target = Target::from_hex("01ff").unwrap();
         let mut big_hash = [0u8; 32];
         big_hash[30..].copy_from_slice(&[1, 0xfe]);
-        assert!(target.accepts(&big_hash, ByteOrder::Big));
-
-        let mut little_hash = [0u8; 32];
-        little_hash[..2].copy_from_slice(&[0xfe, 1]);
-        assert!(target.accepts(&little_hash, ByteOrder::Little));
+        assert!(target.accepts(&big_hash));
     }
 }

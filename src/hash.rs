@@ -49,64 +49,37 @@ pub fn blake2b256(input: &[u8]) -> [u8; 32] {
 #[derive(Clone)]
 pub struct PreparedBlock {
     words: [u64; 16],
-    len: usize,
-    nonce_offset: usize,
-    nonce_size: usize,
-    nonce_little_endian: bool,
 }
 
 impl PreparedBlock {
-    pub fn new(
-        input: &[u8],
-        nonce_offset: usize,
-        nonce_size: usize,
-        nonce_little_endian: bool,
-    ) -> Option<Self> {
-        if input.len() > 128 || nonce_size == 0 || nonce_size > 8 {
-            return None;
-        }
-        if nonce_offset.checked_add(nonce_size)? > input.len() {
+    pub fn new(input: &[u8]) -> Option<Self> {
+        if input.len() != 80 {
             return None;
         }
         let mut block = [0u8; 128];
         block[..input.len()].copy_from_slice(input);
-        let words = words(&block);
         Some(Self {
-            words,
-            len: input.len(),
-            nonce_offset,
-            nonce_size,
-            nonce_little_endian,
+            words: words(&block),
         })
     }
 
     pub fn hash4(&self, first_nonce: u64) -> [[u8; 32]; 4] {
         #[cfg(target_arch = "aarch64")]
-        if self.nonce_size == 8 && self.nonce_offset.is_multiple_of(8) {
-            unsafe {
-                return neon::hash4_aligned_nonce(
-                    &self.words,
-                    self.len,
-                    self.nonce_offset / 8,
-                    first_nonce,
-                    self.nonce_little_endian,
-                );
-            }
+        unsafe {
+            neon::hash4_aligned_nonce(&self.words, 80, 4, first_nonce, true)
         }
 
-        let mut blocks = [self.words; 4];
-        for (lane, block) in blocks.iter_mut().enumerate() {
-            self.write_nonce(block, first_nonce.wrapping_add(lane as u64));
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut blocks = [self.words; 4];
+            for (lane, block) in blocks.iter_mut().enumerate() {
+                block[4] = first_nonce.wrapping_add(lane as u64);
+            }
+            hash4_one_block(&blocks, 80)
         }
-        hash4_one_block(&blocks, self.len)
     }
 
     pub fn datum_candidate_mask(&self, first_nonce: u64, target: [u64; 4]) -> u8 {
-        debug_assert_eq!(self.len, 80);
-        debug_assert_eq!(self.nonce_offset, 32);
-        debug_assert_eq!(self.nonce_size, 8);
-        debug_assert!(self.nonce_little_endian);
-
         #[cfg(target_arch = "aarch64")]
         unsafe {
             neon::datum_candidate_mask(&self.words, first_nonce, target)
@@ -126,60 +99,24 @@ impl PreparedBlock {
     }
 
     pub fn nonce_hex(&self, nonce: u64) -> String {
-        let bytes = if self.nonce_little_endian {
-            nonce.to_le_bytes()
-        } else {
-            nonce.to_be_bytes()
-        };
-        let range = if self.nonce_little_endian {
-            &bytes[..self.nonce_size]
-        } else {
-            &bytes[8 - self.nonce_size..]
-        };
-        hex::encode(range)
-    }
-
-    fn write_nonce(&self, block: &mut [u64; 16], nonce: u64) {
-        let nonce = if self.nonce_little_endian {
-            nonce.to_le_bytes()
-        } else {
-            nonce.to_be_bytes()
-        };
-        let source = if self.nonce_little_endian {
-            &nonce[..self.nonce_size]
-        } else {
-            &nonce[8 - self.nonce_size..]
-        };
-        for (index, byte) in source.iter().enumerate() {
-            let absolute = self.nonce_offset + index;
-            let word = absolute / 8;
-            let shift = (absolute % 8) * 8;
-            block[word] = (block[word] & !(0xffu64 << shift)) | (u64::from(*byte) << shift);
-        }
+        hex::encode(nonce.to_le_bytes())
     }
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 fn hash4_one_block(blocks: &[[u64; 16]; 4], len: usize) -> [[u8; 32]; 4] {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        neon::hash4(blocks, len)
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let mut output = [[0u8; 32]; 4];
-        for lane in 0..4 {
-            let mut h = IV;
-            h[0] ^= 0x0101_0020;
-            let mut block = [0u8; 128];
-            for (word, chunk) in blocks[lane].iter().zip(block.chunks_exact_mut(8)) {
-                chunk.copy_from_slice(&word.to_le_bytes());
-            }
-            compress(&mut h, &block, len as u128, true);
-            output[lane] = digest(h);
+    let mut output = [[0u8; 32]; 4];
+    for lane in 0..4 {
+        let mut h = IV;
+        h[0] ^= 0x0101_0020;
+        let mut block = [0u8; 128];
+        for (word, chunk) in blocks[lane].iter().zip(block.chunks_exact_mut(8)) {
+            chunk.copy_from_slice(&word.to_le_bytes());
         }
-        output
+        compress(&mut h, &block, len as u128, true);
+        output[lane] = digest(h);
     }
+    output
 }
 
 fn compress(h: &mut [u64; 8], block: &[u8; 128], count: u128, last: bool) {
@@ -362,15 +299,6 @@ mod neon {
     }
 
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn hash4(blocks: &[[u64; 16]; 4], len: usize) -> [[u8; 32]; 4] {
-        let mut m = [U64x4::splat(0); 16];
-        for i in 0..16 {
-            m[i] = U64x4::new(blocks[0][i], blocks[1][i], blocks[2][i], blocks[3][i]);
-        }
-        compress4(m, len)
-    }
-
-    #[target_feature(enable = "neon")]
     pub(super) unsafe fn hash4_aligned_nonce(
         words: &[u64; 16],
         len: usize,
@@ -545,9 +473,9 @@ mod tests {
     }
 
     #[test]
-    fn four_way_hash_matches_scalar_with_sia_nonce_layout() {
+    fn four_way_hash_matches_scalar_with_datum_nonce_layout() {
         let header = [0x5au8; 80];
-        let prepared = PreparedBlock::new(&header, 32, 8, true).unwrap();
+        let prepared = PreparedBlock::new(&header).unwrap();
         let hashes = prepared.hash4(42);
 
         for (lane, hash) in hashes.iter().enumerate() {
@@ -564,7 +492,7 @@ mod tests {
             for (index, byte) in header.iter_mut().enumerate() {
                 *byte = seed.wrapping_add((index as u8).wrapping_mul(17));
             }
-            let prepared = PreparedBlock::new(&header, 32, 8, true).unwrap();
+            let prepared = PreparedBlock::new(&header).unwrap();
             for first_nonce in [42, u64::MAX - 2] {
                 let hashes = prepared.hash4(first_nonce);
                 for target_hash in hashes {
@@ -581,37 +509,6 @@ mod tests {
                     });
                     assert_eq!(prepared.datum_candidate_mask(first_nonce, target), expected);
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn four_way_hash_matches_scalar_for_raw_nonce_layouts() {
-        let blob = [0xa5u8; 96];
-        for (offset, size, little_endian) in [
-            (0, 1, true),
-            (3, 4, true),
-            (7, 8, true),
-            (16, 8, false),
-            (55, 4, false),
-        ] {
-            let prepared = PreparedBlock::new(&blob, offset, size, little_endian).unwrap();
-            let hashes = prepared.hash4(0x0102_0304_0506_0708);
-            for (lane, hash) in hashes.iter().enumerate() {
-                let nonce = 0x0102_0304_0506_0708u64 + lane as u64;
-                let nonce_bytes = if little_endian {
-                    nonce.to_le_bytes()
-                } else {
-                    nonce.to_be_bytes()
-                };
-                let source = if little_endian {
-                    &nonce_bytes[..size]
-                } else {
-                    &nonce_bytes[8 - size..]
-                };
-                let mut expected = blob;
-                expected[offset..offset + size].copy_from_slice(source);
-                assert_eq!(*hash, blake2b256(&expected));
             }
         }
     }

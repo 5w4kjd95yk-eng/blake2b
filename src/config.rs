@@ -1,18 +1,10 @@
 use std::{fs, path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::{bail, Context, Result};
-use clap::{ArgGroup, Parser, ValueEnum};
+use clap::{Parser, ValueEnum};
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use url::Url;
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ByteOrder {
-    Big,
-    #[default]
-    Little,
-}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -34,9 +26,7 @@ impl DeviceMode {
 }
 
 #[derive(Debug, Parser)]
-#[command(version, about, group(
-  ArgGroup::new("mode").required(true).args(["sia", "datum", "normal"])
-))]
+#[command(version, about)]
 pub struct Args {
     /// YAML configuration file.
     #[arg(short, long, default_value = "config.yaml")]
@@ -71,25 +61,6 @@ pub struct Args {
     /// Hash locally instead of connecting to a pool.
     #[arg(long)]
     pub benchmark: bool,
-
-    /// Mine Sia's 80-byte block-header layout and Sia Stratum V1 jobs.
-    #[arg(long)]
-    pub sia: bool,
-
-    /// Mine the experimental DATUM BIP-110 profile-0 work layout.
-    #[arg(long)]
-    pub datum: bool,
-
-    /// Mine raw Blake2b-256 blobs using the configured nonce layout.
-    #[arg(long)]
-    pub normal: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    Sia,
-    Datum,
-    Normal,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -102,10 +73,6 @@ struct FileConfig {
     threads: Option<usize>,
     device: Option<DeviceMode>,
     gpu_batch_size: Option<u32>,
-    nonce_offset: Option<usize>,
-    nonce_size: Option<usize>,
-    nonce_endian: Option<ByteOrder>,
-    hash_byte_order: Option<ByteOrder>,
     reconnect_delay_seconds: Option<u64>,
     stats_interval_seconds: Option<u64>,
 }
@@ -119,14 +86,9 @@ pub struct Config {
     pub threads: usize,
     pub device: DeviceMode,
     pub gpu_batch_size: u32,
-    pub nonce_offset: usize,
-    pub nonce_size: usize,
-    pub nonce_endian: ByteOrder,
-    pub hash_byte_order: ByteOrder,
     pub reconnect_delay: Duration,
     pub stats_interval: Duration,
     pub benchmark: bool,
-    pub mode: Mode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,13 +119,6 @@ pub fn load(args: Args) -> Result<Config> {
         );
     };
 
-    let mode = if args.sia {
-        Mode::Sia
-    } else if args.datum {
-        Mode::Datum
-    } else {
-        Mode::Normal
-    };
     let device = args.device.or(file.device).unwrap_or_default();
     let raw_url = args
         .stratum_url
@@ -188,7 +143,7 @@ pub fn load(args: Args) -> Result<Config> {
     let requested_threads = args.threads.or(file.threads).unwrap_or(0);
     let threads = if requested_threads == 0 {
         let available = std::thread::available_parallelism().map_or(1, usize::from);
-        if mode == Mode::Datum && device == DeviceMode::Both {
+        if device == DeviceMode::Both {
             available.saturating_sub(1).max(1)
         } else {
             available
@@ -196,10 +151,6 @@ pub fn load(args: Args) -> Result<Config> {
     } else {
         requested_threads
     };
-    let nonce_size = file.nonce_size.unwrap_or(8);
-    if !(1..=8).contains(&nonce_size) {
-        bail!("nonce_size must be between 1 and 8 bytes");
-    }
     let gpu_batch_size = args
         .gpu_batch_size
         .or(file.gpu_batch_size)
@@ -216,14 +167,9 @@ pub fn load(args: Args) -> Result<Config> {
         threads,
         device,
         gpu_batch_size,
-        nonce_offset: file.nonce_offset.unwrap_or(32),
-        nonce_size,
-        nonce_endian: file.nonce_endian.unwrap_or_default(),
-        hash_byte_order: file.hash_byte_order.unwrap_or_default(),
         reconnect_delay: Duration::from_secs(file.reconnect_delay_seconds.unwrap_or(5)),
         stats_interval: Duration::from_secs(file.stats_interval_seconds.unwrap_or(5).max(1)),
         benchmark: args.benchmark,
-        mode,
     })
 }
 
@@ -280,7 +226,6 @@ mod tests {
     fn accepts_requested_misspelled_flag() {
         let args = Args::try_parse_from([
             "miner",
-            "--normal",
             "--startum-url=stratum+tcp://alice:secret@example.com:5575",
         ])
         .unwrap();
@@ -314,7 +259,6 @@ mod tests {
     fn command_line_selects_gpu_and_batch_size() {
         let args = Args::try_parse_from([
             "miner",
-            "--sia",
             "--benchmark",
             "--config=missing-test-config.yaml",
             "--device=gpu",
@@ -328,10 +272,9 @@ mod tests {
     }
 
     #[test]
-    fn command_line_selects_datum_mode() {
+    fn automatic_thread_count_reserves_one_cpu_for_metal() {
         let args = Args::try_parse_from([
             "miner",
-            "--datum",
             "--benchmark",
             "--config=missing-test-config.yaml",
             "--device=both",
@@ -339,7 +282,6 @@ mod tests {
         .unwrap();
         let config = load(args).unwrap();
 
-        assert_eq!(config.mode, Mode::Datum);
         assert_eq!(
             config.threads,
             std::thread::available_parallelism()
@@ -350,10 +292,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_datum_thread_count_is_authoritative() {
+    fn explicit_thread_count_is_authoritative() {
         let args = Args::try_parse_from([
             "miner",
-            "--datum",
             "--benchmark",
             "--config=missing-test-config.yaml",
             "--device=both",
@@ -363,10 +304,5 @@ mod tests {
         let config = load(args).unwrap();
 
         assert_eq!(config.threads, 4);
-    }
-
-    #[test]
-    fn protocol_modes_are_mutually_exclusive() {
-        assert!(Args::try_parse_from(["miner", "--sia", "--datum"]).is_err());
     }
 }
