@@ -86,8 +86,8 @@ pub fn run(config: Config) -> Result<()> {
         .context("install Ctrl-C handler")?;
 
     let gpu_backend = if config.device.uses_gpu() {
-        let backend = gpu::Miner::new(config.gpu_batch_size)?;
-        log_gpu_backend(&backend);
+        let backend = gpu::default_backend(config.gpu_batch_size)?;
+        log_gpu_backend(backend.as_ref());
         Some(backend)
     } else {
         None
@@ -146,22 +146,25 @@ pub fn run(config: Config) -> Result<()> {
         let _ = worker.join();
     }
     if gpu_failed.load(Ordering::Acquire) {
-        bail!("Metal GPU worker failed");
+        bail!("GPU backend worker failed");
     }
     Ok(())
 }
 
-fn log_gpu_backend(backend: &gpu::Miner) {
+fn log_gpu_backend(backend: &dyn gpu::Backend) {
+    let device = backend.device_info();
     eprintln!(
-        "Metal GPU: {} batch_size={} kernel=datum-split32 nonces/thread=4 threads/threadgroup=64",
-        backend.device_name(),
+        "GPU backend={} device={} index={} batch_size={}",
+        device.backend,
+        device.name,
+        device.index,
         backend.batch_size()
     );
 }
 
 fn spawn_workers(
     config: &Config,
-    gpu_backend: Option<gpu::Miner>,
+    gpu_backend: Option<Box<dyn gpu::Backend>>,
     context: WorkerContext,
 ) -> Result<Vec<thread::JoinHandle<()>>> {
     let mut workers = Vec::new();
@@ -176,17 +179,25 @@ fn spawn_workers(
         }
     }
     if let Some(gpu_backend) = gpu_backend {
+        let device = gpu_backend.device_info().clone();
         let context = context.clone();
         let worker = thread::Builder::new()
-            .name("blake2b-metal".to_owned())
+            .name(format!(
+                "blake2b-{}-{}",
+                device.backend.to_ascii_lowercase(),
+                device.index
+            ))
             .spawn(move || {
                 if let Err(error) = gpu_worker_loop(gpu_backend, &context) {
-                    eprintln!("Metal GPU failed: {error:#}");
+                    eprintln!(
+                        "GPU backend={} device={} index={} failed: {error:#}",
+                        device.backend, device.name, device.index
+                    );
                     context.gpu_failed.store(true, Ordering::Release);
                     context.stop.store(true, Ordering::Release);
                 }
             })
-            .context("spawn Metal GPU worker")?;
+            .context("spawn GPU backend worker")?;
         workers.push(worker);
     }
     Ok(workers)
@@ -232,24 +243,24 @@ fn worker_loop(context: WorkerContext) {
     flush_hashes(&context.hashes.cpu, &mut pending_hashes);
 }
 
-fn gpu_worker_loop(mut miner: gpu::Miner, context: &WorkerContext) -> Result<()> {
-    let mut cached_job: Option<(u64, gpu::Job)> = None;
+fn gpu_worker_loop(mut backend: Box<dyn gpu::Backend>, context: &WorkerContext) -> Result<()> {
+    let mut cached_job: Option<(u64, Box<dyn gpu::PreparedJob>)> = None;
     while !context.stop.load(Ordering::Relaxed) {
         let Some(work) = context.current.load_full() else {
             thread::sleep(Duration::from_millis(10));
             continue;
         };
         if cached_job.as_ref().map(|(epoch, _)| *epoch) != Some(work.epoch) {
-            cached_job = Some((work.epoch, gpu::Job::new(&work.spec)?));
+            cached_job = Some((work.epoch, backend.prepare_job(&work.spec)?));
         }
         let start = work
             .next_nonce
-            .fetch_add(u64::from(miner.batch_size()), Ordering::Relaxed);
-        let winning_nonces = miner.mine(&cached_job.as_ref().unwrap().1, start)?;
+            .fetch_add(backend.batch_size(), Ordering::Relaxed);
+        let winning_nonces = backend.mine(cached_job.as_ref().unwrap().1.as_ref(), start)?;
         context
             .hashes
             .gpu
-            .fetch_add(u64::from(miner.batch_size()), Ordering::Relaxed);
+            .fetch_add(backend.batch_size(), Ordering::Relaxed);
         if context.active_epoch.load(Ordering::Acquire) != work.epoch {
             continue;
         }
@@ -588,8 +599,8 @@ fn benchmark(config: &Config) -> Result<()> {
     let gpu_failed = Arc::new(AtomicBool::new(false));
     let (shares, _unused_receiver) = unbounded();
     let gpu_backend = if config.device.uses_gpu() {
-        let backend = gpu::Miner::new(config.gpu_batch_size)?;
-        log_gpu_backend(&backend);
+        let backend = gpu::default_backend(config.gpu_batch_size)?;
+        log_gpu_backend(backend.as_ref());
         Some(backend)
     } else {
         None
@@ -616,7 +627,7 @@ fn benchmark(config: &Config) -> Result<()> {
     }
     let elapsed = start.elapsed();
     if gpu_failed.load(Ordering::Acquire) {
-        bail!("Metal GPU benchmark failed");
+        bail!("GPU backend benchmark failed");
     }
     let (cpu, gpu) = hashes.snapshot();
     let total = cpu + gpu;

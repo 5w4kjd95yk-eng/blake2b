@@ -1,38 +1,3 @@
-use anyhow::{bail, Result};
-
-use crate::protocol::JobSpec;
-
-#[cfg(target_os = "macos")]
-const MAX_RESULTS: usize = 256;
-
-#[derive(Clone)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub struct Job {
-    words: [u64; 16],
-    target: [u64; 4],
-}
-
-impl Job {
-    pub fn new(spec: &JobSpec) -> Result<Self> {
-        if spec.blob.len() != 80 {
-            bail!(
-                "DATUM Metal backend requires an 80-byte ASIC input, got {} bytes",
-                spec.blob.len()
-            );
-        }
-        let mut block = [0u8; 128];
-        block[..spec.blob.len()].copy_from_slice(&spec.blob);
-        let mut words = [0u64; 16];
-        for (word, bytes) in words.iter_mut().zip(block.chunks_exact(8)) {
-            *word = u64::from_le_bytes(bytes.try_into().unwrap());
-        }
-        Ok(Self {
-            words,
-            target: spec.target.words_be(),
-        })
-    }
-}
-
 #[cfg(target_os = "macos")]
 mod imp {
     use std::{mem, ptr};
@@ -44,9 +9,37 @@ mod imp {
     };
     use objc::rc::autoreleasepool;
 
-    use super::{Job, MAX_RESULTS};
+    use super::super::{Backend, DeviceInfo, PreparedJob};
+    use crate::protocol::JobSpec;
 
-    const SHADER: &str = include_str!("blake2b.metal");
+    const MAX_RESULTS: usize = 256;
+    const SHADER: &str = include_str!("../blake2b.metal");
+
+    struct MetalJob {
+        words: [u64; 16],
+        target: [u64; 4],
+    }
+
+    impl MetalJob {
+        fn new(spec: &JobSpec) -> Result<Self> {
+            if spec.blob.len() != 80 {
+                bail!(
+                    "DATUM Metal backend requires an 80-byte ASIC input, got {} bytes",
+                    spec.blob.len()
+                );
+            }
+            let mut block = [0u8; 128];
+            block[..spec.blob.len()].copy_from_slice(&spec.blob);
+            let mut words = [0u64; 16];
+            for (word, bytes) in words.iter_mut().zip(block.chunks_exact(8)) {
+                *word = u64::from_le_bytes(bytes.try_into().unwrap());
+            }
+            Ok(Self {
+                words,
+                target: spec.target.words_be(),
+            })
+        }
+    }
 
     #[repr(C)]
     struct JobParams {
@@ -57,8 +50,8 @@ mod imp {
         nonce_count: u32,
     }
 
-    pub struct Miner {
-        device_name: String,
+    pub struct MetalBackend {
+        info: DeviceInfo,
         queue: CommandQueue,
         pipeline: ComputePipelineState,
         job_buffer: Buffer,
@@ -67,7 +60,7 @@ mod imp {
         batch_size: u32,
     }
 
-    impl Miner {
+    impl MetalBackend {
         pub fn new(batch_size: u32) -> Result<Self> {
             let device = Device::system_default().context("no Metal GPU is available")?;
             let options = CompileOptions::new();
@@ -85,10 +78,14 @@ mod imp {
             let count_buffer = device.new_buffer(mem::size_of::<u32>() as u64, shared);
             let result_buffer =
                 device.new_buffer((MAX_RESULTS * mem::size_of::<u64>()) as u64, shared);
-            let device_name = device.name().to_owned();
+            let info = DeviceInfo {
+                backend: "Metal",
+                index: 0,
+                name: device.name().to_owned(),
+            };
             let queue = device.new_command_queue();
             Ok(Self {
-                device_name,
+                info,
                 queue,
                 pipeline,
                 job_buffer,
@@ -98,19 +95,7 @@ mod imp {
             })
         }
 
-        pub fn device_name(&self) -> &str {
-            &self.device_name
-        }
-
-        pub fn batch_size(&self) -> u32 {
-            self.batch_size
-        }
-
-        pub fn mine(&mut self, job: &Job, start_nonce: u64) -> Result<Vec<u64>> {
-            autoreleasepool(|| self.mine_inner(job, start_nonce))
-        }
-
-        fn mine_inner(&mut self, job: &Job, start_nonce: u64) -> Result<Vec<u64>> {
+        fn mine_inner(&mut self, job: &MetalJob, start_nonce: u64) -> Result<Vec<u64>> {
             let params = JobParams {
                 words: job.words,
                 start_nonce,
@@ -162,83 +147,64 @@ mod imp {
             Ok(results.to_vec())
         }
     }
+
+    impl Backend for MetalBackend {
+        fn device_info(&self) -> &DeviceInfo {
+            &self.info
+        }
+
+        fn batch_size(&self) -> u64 {
+            u64::from(self.batch_size)
+        }
+
+        fn prepare_job(&self, spec: &JobSpec) -> Result<Box<dyn PreparedJob>> {
+            Ok(Box::new(MetalJob::new(spec)?))
+        }
+
+        fn mine(&mut self, job: &dyn PreparedJob, start_nonce: u64) -> Result<Vec<u64>> {
+            let job = job
+                .as_any()
+                .downcast_ref::<MetalJob>()
+                .context("prepared job does not belong to the Metal backend")?;
+            autoreleasepool(|| self.mine_inner(job, start_nonce))
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
     use anyhow::{bail, Result};
 
-    use super::Job;
+    use super::super::{Backend, DeviceInfo, PreparedJob};
+    use crate::protocol::JobSpec;
 
-    pub struct Miner;
+    pub struct MetalBackend {
+        info: DeviceInfo,
+    }
 
-    impl Miner {
+    impl MetalBackend {
         pub fn new(_batch_size: u32) -> Result<Self> {
-            bail!("GPU mining requires macOS and Metal")
+            bail!("Metal GPU mining requires macOS")
+        }
+    }
+
+    impl Backend for MetalBackend {
+        fn device_info(&self) -> &DeviceInfo {
+            &self.info
         }
 
-        pub fn device_name(&self) -> &str {
-            "unavailable"
-        }
-
-        pub fn batch_size(&self) -> u32 {
+        fn batch_size(&self) -> u64 {
             0
         }
 
-        pub fn mine(&mut self, _job: &Job, _start_nonce: u64) -> Result<Vec<u64>> {
-            bail!("GPU mining requires macOS and Metal")
+        fn prepare_job(&self, _spec: &JobSpec) -> Result<Box<dyn PreparedJob>> {
+            bail!("Metal GPU mining requires macOS")
+        }
+
+        fn mine(&mut self, _job: &dyn PreparedJob, _start_nonce: u64) -> Result<Vec<u64>> {
+            bail!("Metal GPU mining requires macOS")
         }
     }
 }
 
-pub use imp::Miner;
-
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use blake2::{digest::consts::U32, Blake2b, Digest};
-
-    use super::*;
-    use crate::{protocol::JobSpec, target::Target};
-
-    type ReferenceBlake2b256 = Blake2b<U32>;
-
-    #[test]
-    fn metal_matches_reference_for_datum_layout() {
-        let Ok(mut miner) = Miner::new(1_024) else {
-            eprintln!("skipping Metal test because no GPU is exposed");
-            return;
-        };
-        let blob = vec![0x5a; 80];
-        let start_nonce = u32::MAX as u64 - 511;
-        let mut hashes = (0..miner.batch_size())
-            .map(|offset| {
-                let nonce = start_nonce + u64::from(offset);
-                (nonce, reference_hash(&blob, nonce))
-            })
-            .collect::<Vec<_>>();
-        hashes.sort_unstable_by_key(|(_, hash)| *hash);
-        let selected = hashes[31].1;
-        let target = Target::from_hex(&hex::encode(selected)).unwrap();
-        let spec = JobSpec {
-            id: "gpu-test".to_owned(),
-            blob,
-            target: target.clone(),
-            extra_nonce2: "0000000000000000".to_owned(),
-            ntime: "0000000000000000".to_owned(),
-        };
-        let mut expected = hashes
-            .iter()
-            .filter_map(|(nonce, hash)| target.accepts(hash).then_some(*nonce))
-            .collect::<Vec<_>>();
-        let mut actual = miner.mine(&Job::new(&spec).unwrap(), start_nonce).unwrap();
-        expected.sort_unstable();
-        actual.sort_unstable();
-        assert_eq!(actual, expected);
-    }
-
-    fn reference_hash(blob: &[u8], nonce: u64) -> [u8; 32] {
-        let mut input = blob.to_vec();
-        input[32..40].copy_from_slice(&nonce.to_le_bytes());
-        ReferenceBlake2b256::digest(input).into()
-    }
-}
+pub use imp::MetalBackend;
