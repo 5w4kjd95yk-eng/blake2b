@@ -32,6 +32,7 @@ pub enum GpuBackend {
     Auto,
     Metal,
     Cuda,
+    Opencl,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,9 +66,11 @@ impl FromStr for GpuDevices {
         if indices.is_empty() {
             bail!("gpu_devices must be an index, a comma-separated list, or all");
         }
-        if indices.iter().enumerate().any(|(position, index)| {
-            indices[..position].contains(index)
-        }) {
+        if indices
+            .iter()
+            .enumerate()
+            .any(|(position, index)| indices[..position].contains(index))
+        {
             bail!("gpu_devices must not contain duplicate indices");
         }
         Ok(Self::Indices(indices))
@@ -127,7 +130,7 @@ pub struct Args {
     #[arg(long, value_enum)]
     pub device: Option<DeviceMode>,
 
-    /// GPU implementation: auto, metal, or cuda.
+    /// GPU implementation: auto, metal, cuda, or opencl.
     #[arg(long, value_enum)]
     pub gpu_backend: Option<GpuBackend>,
 
@@ -135,7 +138,7 @@ pub struct Args {
     #[arg(long)]
     pub gpu_devices: Option<GpuDevices>,
 
-    /// Nonces dispatched in each Metal command buffer.
+    /// Nonces dispatched in each GPU batch.
     #[arg(long)]
     pub gpu_batch_size: Option<u32>,
 

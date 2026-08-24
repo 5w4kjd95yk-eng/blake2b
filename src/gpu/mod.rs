@@ -9,6 +9,7 @@ use crate::{
 
 mod cuda;
 mod metal;
+mod opencl;
 
 /// Identity shared by every GPU backend.
 #[derive(Clone, Debug)]
@@ -51,6 +52,7 @@ pub fn devices(requested: GpuBackend) -> Result<Vec<DeviceInfo>> {
             Ok(vec![backend.device_info().clone()])
         }
         GpuBackend::Cuda => cuda::devices(),
+        GpuBackend::Opencl => opencl::devices(),
         GpuBackend::Auto => unreachable!(),
     }
 }
@@ -73,6 +75,13 @@ pub fn backends(
             selected_indices(selected, available.len())?
                 .into_iter()
                 .map(|index| cuda::backend(index, batch_size))
+                .collect()
+        }
+        GpuBackend::Opencl => {
+            let available = opencl::devices()?;
+            selected_indices(selected, available.len())?
+                .into_iter()
+                .map(|index| opencl::backend(index, batch_size))
                 .collect()
         }
         GpuBackend::Auto => unreachable!(),
