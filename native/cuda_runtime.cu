@@ -21,6 +21,135 @@ struct Blake2bCudaBuffer {
     size_t size;
 };
 
+struct Blake2bCudaJobParams {
+    unsigned long long words[10];
+    unsigned long long start_nonce;
+    unsigned long long nonce_count;
+    unsigned long long target_prefix;
+    unsigned long long generation;
+    unsigned int result_capacity;
+    unsigned int reserved;
+};
+
+struct Blake2bCudaResultSummary {
+    unsigned int count;
+    unsigned int overflow;
+    unsigned long long generation;
+};
+
+struct Blake2bCudaMiner {
+    int device;
+    unsigned int capacity;
+    Blake2bCudaJobParams *params;
+    Blake2bCudaResultSummary *summary;
+    unsigned long long *results;
+};
+
+static_assert(sizeof(Blake2bCudaJobParams) == 120, "unexpected CUDA job layout");
+static_assert(__builtin_offsetof(Blake2bCudaJobParams, start_nonce) == 80,
+              "unexpected CUDA start_nonce offset");
+static_assert(__builtin_offsetof(Blake2bCudaJobParams, result_capacity) == 112,
+              "unexpected CUDA result_capacity offset");
+static_assert(sizeof(Blake2bCudaResultSummary) == 16, "unexpected CUDA result layout");
+
+__device__ __constant__ unsigned char blake2b_sigma[12][16] = {
+    { 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15},
+    {14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3},
+    {11,  8, 12,  0,  5,  2, 15, 13, 10, 14,  3,  6,  7,  1,  9,  4},
+    { 7,  9,  3,  1, 13, 12, 11, 14,  2,  6,  5, 10,  4,  0, 15,  8},
+    { 9,  0,  5,  7,  2,  4, 10, 15, 14,  1, 11, 12,  6,  8,  3, 13},
+    { 2, 12,  6, 10,  0, 11,  8,  3,  4, 13,  7,  5, 15, 14,  1,  9},
+    {12,  5,  1, 15, 14, 13,  4, 10,  0,  7,  6,  3,  9,  2,  8, 11},
+    {13, 11,  7, 14, 12,  1,  3,  9,  5,  0, 15,  4,  8,  6,  2, 10},
+    { 6, 15, 14,  9, 11,  3,  0,  8, 12,  2, 13,  7,  1,  4, 10,  5},
+    {10,  2,  8,  4,  7,  6,  1,  5, 15, 11,  9, 14,  3, 12, 13,  0},
+    { 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15},
+    {14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3},
+};
+
+__device__ __forceinline__ unsigned long long blake2b_rotr(
+    unsigned long long value, unsigned int shift) {
+    return (value >> shift) | (value << (64 - shift));
+}
+
+__device__ __forceinline__ unsigned long long blake2b_bswap(
+    unsigned long long value) {
+    value = ((value & 0x00ff00ff00ff00ffULL) << 8) |
+            ((value >> 8) & 0x00ff00ff00ff00ffULL);
+    value = ((value & 0x0000ffff0000ffffULL) << 16) |
+            ((value >> 16) & 0x0000ffff0000ffffULL);
+    return (value << 32) | (value >> 32);
+}
+
+__device__ __forceinline__ void blake2b_g(
+    unsigned long long &a, unsigned long long &b,
+    unsigned long long &c, unsigned long long &d,
+    unsigned long long x, unsigned long long y) {
+    a = a + b + x;
+    d = blake2b_rotr(d ^ a, 32);
+    c += d;
+    b = blake2b_rotr(b ^ c, 24);
+    a = a + b + y;
+    d = blake2b_rotr(d ^ a, 16);
+    c += d;
+    b = blake2b_rotr(b ^ c, 63);
+}
+
+__device__ unsigned long long blake2b_datum_prefix(
+    const Blake2bCudaJobParams *params, unsigned long long nonce) {
+    const unsigned long long iv[8] = {
+        0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+        0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+        0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+        0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL,
+    };
+    unsigned long long m[16] = {};
+    for (int index = 0; index < 10; ++index) m[index] = params->words[index];
+    // Header bytes 32..40 are the little-endian representation of this word.
+    m[4] = nonce;
+
+    unsigned long long h[8];
+    for (int index = 0; index < 8; ++index) h[index] = iv[index];
+    h[0] ^= 0x01010020ULL;  // fanout 1, depth 1, 32-byte digest, no key
+    unsigned long long v[16];
+    for (int index = 0; index < 8; ++index) {
+        v[index] = h[index];
+        v[index + 8] = iv[index];
+    }
+    v[12] ^= 80ULL;
+    v[14] = ~v[14];
+
+    for (int round = 0; round < 12; ++round) {
+        const unsigned char *s = blake2b_sigma[round];
+        blake2b_g(v[0], v[4], v[8],  v[12], m[s[0]],  m[s[1]]);
+        blake2b_g(v[1], v[5], v[9],  v[13], m[s[2]],  m[s[3]]);
+        blake2b_g(v[2], v[6], v[10], v[14], m[s[4]],  m[s[5]]);
+        blake2b_g(v[3], v[7], v[11], v[15], m[s[6]],  m[s[7]]);
+        blake2b_g(v[0], v[5], v[10], v[15], m[s[8]],  m[s[9]]);
+        blake2b_g(v[1], v[6], v[11], v[12], m[s[10]], m[s[11]]);
+        blake2b_g(v[2], v[7], v[8],  v[13], m[s[12]], m[s[13]]);
+        blake2b_g(v[3], v[4], v[9],  v[14], m[s[14]], m[s[15]]);
+    }
+    return blake2b_bswap(h[0] ^ v[0] ^ v[8]);
+}
+
+__global__ void blake2b_datum_kernel(
+    const Blake2bCudaJobParams *params, Blake2bCudaResultSummary *summary,
+    unsigned long long *results) {
+    const unsigned long long offset =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (offset >= params->nonce_count) return;
+    const unsigned long long nonce = params->start_nonce + offset;
+    if (blake2b_datum_prefix(params, nonce) <= params->target_prefix) {
+        const unsigned int slot = atomicAdd(&summary->count, 1U);
+        if (slot < params->result_capacity) {
+            results[slot] = nonce;
+        } else {
+            atomicAdd(&summary->overflow, 1U);
+        }
+    }
+}
+
 int blake2b_cuda_device_count(int *count) {
     if (count == 0) return static_cast<int>(cudaErrorInvalidValue);
     return static_cast<int>(cudaGetDeviceCount(count));
@@ -96,6 +225,85 @@ int blake2b_cuda_buffer_release(Blake2bCudaBuffer *buffer) {
     cudaError_t error = cudaSetDevice(buffer->device);
     if (error == cudaSuccess) error = cudaFree(buffer->pointer);
     free(buffer);
+    return static_cast<int>(error);
+}
+
+int blake2b_cuda_miner_create(Blake2bCudaContext *context, unsigned int capacity,
+                              Blake2bCudaMiner **miner) {
+    if (context == 0 || capacity == 0 || miner == 0)
+        return static_cast<int>(cudaErrorInvalidValue);
+    *miner = 0;
+    cudaError_t error = cudaSetDevice(context->device);
+    if (error != cudaSuccess) return static_cast<int>(error);
+    auto *created = static_cast<Blake2bCudaMiner *>(malloc(sizeof(Blake2bCudaMiner)));
+    if (created == 0) return static_cast<int>(cudaErrorMemoryAllocation);
+    *created = {};
+    created->device = context->device;
+    created->capacity = capacity;
+    error = cudaMalloc(&created->params, sizeof(Blake2bCudaJobParams));
+    if (error == cudaSuccess)
+        error = cudaMalloc(&created->summary, sizeof(Blake2bCudaResultSummary));
+    if (error == cudaSuccess)
+        error = cudaMalloc(&created->results, capacity * sizeof(unsigned long long));
+    if (error != cudaSuccess) {
+        cudaFree(created->results);
+        cudaFree(created->summary);
+        cudaFree(created->params);
+        free(created);
+        return static_cast<int>(error);
+    }
+    *miner = created;
+    return static_cast<int>(cudaSuccess);
+}
+
+int blake2b_cuda_miner_destroy(Blake2bCudaMiner *miner) {
+    if (miner == 0) return static_cast<int>(cudaSuccess);
+    cudaError_t error = cudaSetDevice(miner->device);
+    if (error == cudaSuccess) error = cudaFree(miner->results);
+    cudaError_t next = cudaFree(miner->summary);
+    if (error == cudaSuccess) error = next;
+    next = cudaFree(miner->params);
+    if (error == cudaSuccess) error = next;
+    free(miner);
+    return static_cast<int>(error);
+}
+
+int blake2b_cuda_mine(Blake2bCudaMiner *miner,
+                      const Blake2bCudaJobParams *params,
+                      Blake2bCudaResultSummary *summary,
+                      unsigned long long *results) {
+    if (miner == 0 || params == 0 || summary == 0 || results == 0 ||
+        params->result_capacity != miner->capacity || params->nonce_count == 0)
+        return static_cast<int>(cudaErrorInvalidValue);
+    cudaError_t error = cudaSetDevice(miner->device);
+    if (error != cudaSuccess) return static_cast<int>(error);
+    error = cudaMemcpy(miner->params, params, sizeof(*params), cudaMemcpyHostToDevice);
+    if (error != cudaSuccess) return static_cast<int>(error);
+    // The host owns reset ordering. Never clear this state from inside the kernel.
+    error = cudaMemset(miner->summary, 0, sizeof(*summary));
+    if (error != cudaSuccess) return static_cast<int>(error);
+    Blake2bCudaResultSummary initial{};
+    initial.generation = params->generation;
+    error = cudaMemcpy(miner->summary, &initial, sizeof(initial), cudaMemcpyHostToDevice);
+    if (error != cudaSuccess) return static_cast<int>(error);
+
+    constexpr unsigned int block_size = 256;
+    const unsigned long long blocks =
+        (params->nonce_count + block_size - 1) / block_size;
+    if (blocks > 0xffffffffULL) return static_cast<int>(cudaErrorInvalidConfiguration);
+    blake2b_datum_kernel<<<static_cast<unsigned int>(blocks), block_size>>>(
+        miner->params, miner->summary, miner->results);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return static_cast<int>(error);
+    error = cudaDeviceSynchronize();
+    if (error != cudaSuccess) return static_cast<int>(error);
+    error = cudaMemcpy(summary, miner->summary, sizeof(*summary), cudaMemcpyDeviceToHost);
+    if (error != cudaSuccess) return static_cast<int>(error);
+    const unsigned int copied = summary->count < miner->capacity
+        ? summary->count : miner->capacity;
+    if (copied != 0)
+        error = cudaMemcpy(results, miner->results,
+                           copied * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
     return static_cast<int>(error);
 }
 
