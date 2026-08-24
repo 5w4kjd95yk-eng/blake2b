@@ -160,7 +160,7 @@ mod imp {
             u64::from(self.batch_size)
         }
 
-        fn prepare_job(&self, spec: &JobSpec) -> Result<Box<dyn PreparedJob>> {
+        fn prepare_job(&self, spec: &JobSpec, _generation: u64) -> Result<Box<dyn PreparedJob>> {
             Ok(Box::new(MetalJob::new(spec)?))
         }
 
@@ -200,7 +200,7 @@ mod imp {
             0
         }
 
-        fn prepare_job(&self, _spec: &JobSpec) -> Result<Box<dyn PreparedJob>> {
+        fn prepare_job(&self, _spec: &JobSpec, _generation: u64) -> Result<Box<dyn PreparedJob>> {
             bail!("Metal GPU mining requires macOS")
         }
 

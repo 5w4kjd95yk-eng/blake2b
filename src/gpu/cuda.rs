@@ -5,7 +5,7 @@ mod imp {
         ptr::NonNull,
     };
 
-    use anyhow::{bail, Result};
+    use anyhow::{bail, Context as _, Result};
 
     use super::super::{Backend, DeviceInfo, PreparedJob};
     use crate::protocol::JobSpec;
@@ -19,6 +19,25 @@ mod imp {
         usable_memory: u64,
     }
 
+    #[repr(C)]
+    struct NativeJobParams {
+        words: [u64; 10],
+        start_nonce: u64,
+        nonce_count: u64,
+        target_prefix: u64,
+        generation: u64,
+        result_capacity: u32,
+        reserved: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct NativeResultSummary {
+        count: u32,
+        overflow: u32,
+        generation: u64,
+    }
+
     unsafe extern "C" {
         fn blake2b_cuda_device_count(count: *mut c_int) -> c_int;
         fn blake2b_cuda_device_info(device: c_int, info: *mut NativeDeviceInfo) -> c_int;
@@ -30,6 +49,18 @@ mod imp {
             buffer: *mut *mut c_void,
         ) -> c_int;
         fn blake2b_cuda_buffer_release(buffer: *mut c_void) -> c_int;
+        fn blake2b_cuda_miner_create(
+            context: *mut c_void,
+            capacity: u32,
+            miner: *mut *mut c_void,
+        ) -> c_int;
+        fn blake2b_cuda_miner_destroy(miner: *mut c_void) -> c_int;
+        fn blake2b_cuda_mine(
+            miner: *mut c_void,
+            params: *const NativeJobParams,
+            summary: *mut NativeResultSummary,
+            results: *mut u64,
+        ) -> c_int;
         fn blake2b_cuda_error_string(error: c_int) -> *const c_char;
     }
 
@@ -101,6 +132,61 @@ mod imp {
         raw: NonNull<c_void>,
     }
 
+    const MAX_RESULTS: usize = 256;
+
+    struct Miner {
+        raw: NonNull<c_void>,
+    }
+
+    unsafe impl Send for Miner {}
+
+    impl Miner {
+        fn new(context: &Context) -> Result<Self> {
+            let mut raw = std::ptr::null_mut();
+            check(unsafe {
+                blake2b_cuda_miner_create(context.raw.as_ptr(), MAX_RESULTS as u32, &mut raw)
+            })?;
+            Ok(Self {
+                raw: NonNull::new(raw).expect("successful CUDA miner creation returned null"),
+            })
+        }
+    }
+
+    impl Drop for Miner {
+        fn drop(&mut self) {
+            let code = unsafe { blake2b_cuda_miner_destroy(self.raw.as_ptr()) };
+            if code != 0 {
+                eprintln!("failed to destroy CUDA miner: {}", error_message(code));
+            }
+        }
+    }
+
+    struct CudaJob {
+        words: [u64; 10],
+        target_prefix: u64,
+        generation: u64,
+    }
+
+    impl CudaJob {
+        fn new(spec: &JobSpec, generation: u64) -> Result<Self> {
+            if spec.blob.len() != 80 {
+                bail!(
+                    "DATUM CUDA backend requires an 80-byte ASIC input, got {} bytes",
+                    spec.blob.len()
+                );
+            }
+            let mut words = [0; 10];
+            for (word, bytes) in words.iter_mut().zip(spec.blob.chunks_exact(8)) {
+                *word = u64::from_le_bytes(bytes.try_into().unwrap());
+            }
+            Ok(Self {
+                words,
+                target_prefix: spec.target.words_be()[0],
+                generation,
+            })
+        }
+    }
+
     unsafe impl Send for Buffer {}
 
     impl Drop for Buffer {
@@ -115,6 +201,7 @@ mod imp {
     pub struct CudaBackend {
         device: DeviceInfo,
         batch_size: u64,
+        miner: Miner,
         _context: Context,
     }
 
@@ -124,10 +211,13 @@ mod imp {
                 .into_iter()
                 .find(|device| device.index == index)
                 .ok_or_else(|| anyhow::anyhow!("CUDA device index {index} does not exist"))?;
+            let context = Context::new(index)?;
+            let miner = Miner::new(&context)?;
             Ok(Self {
                 device,
                 batch_size: u64::from(batch_size),
-                _context: Context::new(index)?,
+                miner,
+                _context: context,
             })
         }
     }
@@ -141,12 +231,51 @@ mod imp {
             self.batch_size
         }
 
-        fn prepare_job(&self, _spec: &JobSpec) -> Result<Box<dyn PreparedJob>> {
-            bail!("CUDA hashing is not implemented until Sprint 3")
+        fn prepare_job(&self, spec: &JobSpec, generation: u64) -> Result<Box<dyn PreparedJob>> {
+            Ok(Box::new(CudaJob::new(spec, generation)?))
         }
 
-        fn mine(&mut self, _job: &dyn PreparedJob, _start_nonce: u64) -> Result<Vec<u64>> {
-            bail!("CUDA hashing is not implemented until Sprint 3")
+        fn mine(&mut self, job: &dyn PreparedJob, start_nonce: u64) -> Result<Vec<u64>> {
+            let job = job
+                .as_any()
+                .downcast_ref::<CudaJob>()
+                .context("prepared job does not belong to the CUDA backend")?;
+            let params = NativeJobParams {
+                words: job.words,
+                start_nonce,
+                nonce_count: self.batch_size,
+                target_prefix: job.target_prefix,
+                generation: job.generation,
+                result_capacity: MAX_RESULTS as u32,
+                reserved: 0,
+            };
+            let mut summary = NativeResultSummary::default();
+            let mut results = vec![0; MAX_RESULTS];
+            check(unsafe {
+                blake2b_cuda_mine(
+                    self.miner.raw.as_ptr(),
+                    &params,
+                    &mut summary,
+                    results.as_mut_ptr(),
+                )
+            })?;
+            if summary.generation != job.generation {
+                bail!(
+                    "CUDA result generation mismatch: expected {}, got {}",
+                    job.generation,
+                    summary.generation
+                );
+            }
+            if summary.overflow != 0 || summary.count as usize > MAX_RESULTS {
+                bail!(
+                    "CUDA result buffer overflow: {} candidates exceeded capacity {} in one {}-nonce batch",
+                    summary.overflow,
+                    MAX_RESULTS,
+                    self.batch_size
+                );
+            }
+            results.truncate(summary.count as usize);
+            Ok(results)
         }
     }
 
@@ -163,7 +292,9 @@ mod imp {
         if raw.is_null() {
             "unknown CUDA error".to_owned()
         } else {
-            unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned()
+            unsafe { CStr::from_ptr(raw) }
+                .to_string_lossy()
+                .into_owned()
         }
     }
 }

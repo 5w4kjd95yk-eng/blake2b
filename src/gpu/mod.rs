@@ -40,7 +40,7 @@ impl<T: Any + Send + Sync> PreparedJob for T {
 pub trait Backend: Send {
     fn device_info(&self) -> &DeviceInfo;
     fn batch_size(&self) -> u64;
-    fn prepare_job(&self, spec: &JobSpec) -> Result<Box<dyn PreparedJob>>;
+    fn prepare_job(&self, spec: &JobSpec, generation: u64) -> Result<Box<dyn PreparedJob>>;
     fn mine(&mut self, job: &dyn PreparedJob, start_nonce: u64) -> Result<Vec<u64>>;
 }
 
@@ -148,7 +148,7 @@ mod tests {
             .iter()
             .filter_map(|(nonce, hash)| target.accepts(hash).then_some(*nonce))
             .collect::<Vec<_>>();
-        let job = backend.prepare_job(&spec).unwrap();
+        let job = backend.prepare_job(&spec, 1).unwrap();
         let mut actual = backend.mine(job.as_ref(), start_nonce).unwrap();
         expected.sort_unstable();
         actual.sort_unstable();

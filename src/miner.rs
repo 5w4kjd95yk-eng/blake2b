@@ -285,7 +285,7 @@ fn gpu_worker_loop(mut backend: Box<dyn gpu::Backend>, context: &WorkerContext) 
             continue;
         };
         if cached_job.as_ref().map(|(epoch, _)| *epoch) != Some(work.epoch) {
-            cached_job = Some((work.epoch, backend.prepare_job(&work.spec)?));
+            cached_job = Some((work.epoch, backend.prepare_job(&work.spec, work.epoch)?));
         }
         let start = work
             .next_nonce
