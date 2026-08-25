@@ -101,6 +101,7 @@ pub fn run(config: Config) -> Result<()> {
             config.gpu_backend,
             &config.gpu_devices,
             config.gpu_batch_size,
+            opencl_options(&config),
         )?;
         for backend in &backends {
             log_gpu_backend(backend.as_ref());
@@ -209,6 +210,15 @@ fn log_gpu_backend(backend: &dyn gpu::Backend) {
         device.index,
         backend.batch_size()
     );
+}
+
+fn opencl_options(config: &Config) -> gpu::OpenClOptions {
+    gpu::OpenClOptions {
+        tuning: config.opencl_tuning,
+        kernel: config.opencl_kernel,
+        local_size: config.opencl_local_size,
+        nonces_per_item: config.opencl_nonces_per_item,
+    }
 }
 
 fn list_devices(config: &Config) -> Result<()> {
@@ -753,6 +763,7 @@ fn benchmark(config: &Config) -> Result<()> {
             config.gpu_backend,
             &config.gpu_devices,
             config.gpu_batch_size,
+            opencl_options(config),
         )?;
         for backend in &backends {
             log_gpu_backend(backend.as_ref());
@@ -773,7 +784,7 @@ fn benchmark(config: &Config) -> Result<()> {
             shares,
         },
     )?;
-    let duration = Duration::from_secs(3);
+    let duration = config.benchmark_duration;
     let start = Instant::now();
     thread::sleep(duration);
     stop.store(true, Ordering::Release);

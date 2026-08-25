@@ -3,12 +3,32 @@ use std::any::Any;
 use anyhow::{bail, Result};
 
 use crate::{
-    config::{GpuBackend, GpuDevices},
+    config::{GpuBackend, GpuDevices, OpenClKernel, OpenClTuning},
     protocol::JobSpec,
 };
 
+#[derive(Clone, Copy, Debug)]
+pub struct OpenClOptions {
+    pub tuning: OpenClTuning,
+    pub kernel: Option<OpenClKernel>,
+    pub local_size: Option<usize>,
+    pub nonces_per_item: Option<u32>,
+}
+
+impl Default for OpenClOptions {
+    fn default() -> Self {
+        Self {
+            tuning: OpenClTuning::Auto,
+            kernel: None,
+            local_size: None,
+            nonces_per_item: None,
+        }
+    }
+}
+
 mod cuda;
 mod metal;
+mod opencl;
 
 /// Identity shared by every GPU backend.
 #[derive(Clone, Debug)]
@@ -51,6 +71,7 @@ pub fn devices(requested: GpuBackend) -> Result<Vec<DeviceInfo>> {
             Ok(vec![backend.device_info().clone()])
         }
         GpuBackend::Cuda => cuda::devices(),
+        GpuBackend::Opencl => opencl::devices(),
         GpuBackend::Auto => unreachable!(),
     }
 }
@@ -59,6 +80,7 @@ pub fn backends(
     requested: GpuBackend,
     selected: &GpuDevices,
     batch_size: u32,
+    opencl_options: OpenClOptions,
 ) -> Result<Vec<Box<dyn Backend>>> {
     match resolve_backend(requested)? {
         GpuBackend::Metal => {
@@ -75,6 +97,13 @@ pub fn backends(
                 .map(|index| cuda::backend(index, batch_size))
                 .collect()
         }
+        GpuBackend::Opencl => {
+            let available = opencl::devices()?;
+            selected_indices(selected, available.len())?
+                .into_iter()
+                .map(|index| opencl::backend(index, batch_size, opencl_options))
+                .collect()
+        }
         GpuBackend::Auto => unreachable!(),
     }
 }
@@ -82,15 +111,19 @@ pub fn backends(
 fn resolve_backend(requested: GpuBackend) -> Result<GpuBackend> {
     match requested {
         GpuBackend::Auto if cfg!(target_os = "macos") => Ok(GpuBackend::Metal),
-        GpuBackend::Auto if cfg!(all(target_os = "linux", feature = "cuda")) => {
-            if cuda::devices()?.is_empty() {
-                bail!("no NVIDIA CUDA devices are available");
+        GpuBackend::Auto => {
+            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            if cuda::devices().is_ok_and(|devices| !devices.is_empty()) {
+                return Ok(GpuBackend::Cuda);
             }
-            Ok(GpuBackend::Cuda)
+            #[cfg(feature = "opencl")]
+            if opencl::devices().is_ok_and(|devices| !devices.is_empty()) {
+                return Ok(GpuBackend::Opencl);
+            }
+            bail!(
+                "no automatic GPU backend is available; choose an explicit backend or rebuild with CUDA/OpenCL support"
+            )
         }
-        GpuBackend::Auto => bail!(
-            "no automatic GPU backend is available on this build; choose CPU or rebuild with CUDA"
-        ),
         backend => Ok(backend),
     }
 }
@@ -120,9 +153,13 @@ mod tests {
 
     #[test]
     fn metal_matches_reference_for_datum_layout() {
-        let Ok(mut backend) = backends(GpuBackend::Metal, &GpuDevices::default(), 1_024)
-            .map(|mut backends| backends.remove(0))
-        else {
+        let Ok(mut backend) = backends(
+            GpuBackend::Metal,
+            &GpuDevices::default(),
+            1_024,
+            OpenClOptions::default(),
+        )
+        .map(|mut backends| backends.remove(0)) else {
             eprintln!("skipping Metal test because no GPU is exposed");
             return;
         };

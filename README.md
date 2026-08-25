@@ -6,12 +6,11 @@ default GPU backend runs a Metal compute kernel with four nonces per thread.
 CPU and GPU workers reserve disjoint nonce ranges from the same job.
 
 The GPU worker uses a backend-neutral synchronous interface for device
-identity, job preparation, batch dispatch, and candidate collection. Metal is
-the production hashing backend for now. CUDA device discovery and lifecycle
-support are available behind an opt-in feature; the CUDA hashing kernel arrives
-in Sprint 3. CUDA is not required by default builds. Sprint 1
-baseline and acceptance results are recorded in
-[`docs/cuda-sprint-1.md`](docs/cuda-sprint-1.md).
+identity, job preparation, batch dispatch, and candidate collection. Metal,
+CUDA, and OpenCL implementations are available. CUDA and OpenCL are opt-in and
+are not required by default builds. The OpenCL implementation is a portable,
+auto-tuned backend whose split 64-bit rotation core is adapted from the tuned
+[sgminer-blake2b Sia kernel](https://github.com/zhq1/sgminer-blake2b/blob/master/kernel/sia.cl).
 
 Rust fits this job. It exposes AArch64 intrinsics without requiring assembly,
 keeps the networking/configuration code memory-safe, and has no runtime or GC
@@ -33,6 +32,22 @@ cargo build --release --features cuda
 `CUDA_ARCHITECTURES` to a comma-separated compute capability list, for example
 `75,86,89`. The default is `75,80,86,89`.
 
+OpenCL builds load the system OpenCL implementation at runtime:
+
+```sh
+cargo build --release --features opencl
+```
+
+The DATUM OpenCL backend validates and briefly profiles portable OpenCL C 1.2
+kernel and work-group candidates the first time it sees a device/driver/kernel
+combination. The winner is cached in the platform user cache directory and is
+reused without retuning on later starts. Use `--opencl-tuning=retune` after a
+hardware change, or `--opencl-tuning=off` for the conservative portable
+fallback. `--opencl-kernel`, `--opencl-nonces-per-item`, and
+`--opencl-local-size` provide diagnostic overrides.
+On macOS the cache is `~/Library/Caches/blake2b-miner/opencl-tuning.json`; on
+Linux it is under `$XDG_CACHE_HOME` or `~/.cache`.
+
 ## Configuration
 
 Edit `config.yaml`:
@@ -44,7 +59,7 @@ username: "wallet.worker"
 password: "x"
 threads: 0 # automatic; Datum both-mode reserves one logical CPU for Metal
 device: both # cpu, gpu, or both
-gpu_backend: auto # auto, metal, or cuda
+gpu_backend: auto # auto, metal, cuda, or opencl
 gpu_devices: all # one index, a YAML list such as [0, 2], or all
 gpu_batch_size: 1048576 # use 16777216 for balanced M4 Datum throughput
 
@@ -106,18 +121,32 @@ Inventory GPUs without loading the Stratum configuration or connecting to a
 gateway:
 
 ```sh
-target/release/blake2b-miner --list-devices --gpu-backend cuda
+target/release/blake2b-miner --list-devices --gpu-backend opencl
 ```
 
-On macOS, `auto` selects Metal. On Linux, it selects CUDA only in a
-CUDA-enabled build with an available NVIDIA device. Explicitly unavailable
-backends fail before workers or a Stratum session are started.
+On macOS, `auto` selects Metal. Elsewhere, it prefers CUDA when that feature and
+an NVIDIA device are available, then tries OpenCL when enabled. Explicitly
+unavailable backends fail before workers or a Stratum session are started.
 
 Run a three-second local benchmark without connecting to a pool:
 
 ```sh
 target/release/blake2b-miner --benchmark --device both
 ```
+
+Set a longer duration when tuning OpenCL without involving another backend:
+
+```sh
+target/release/blake2b-miner \
+  --benchmark --benchmark-seconds=30 \
+  --device=gpu --gpu-backend=opencl
+```
+
+On the Apple M4 used for this tuning pass, the 30-second OpenCL-only result at
+a 16,777,216-nonce batch improved from 453.5 MH/s to 460.1 MH/s. At the default
+1,048,576-nonce batch, eliminating per-batch synchronization overhead improved
+the result from 341.5 MH/s to 409.9 MH/s. These figures are device-specific;
+other OpenCL devices select and cache their own launch parameters.
 
 ## Wire format
 

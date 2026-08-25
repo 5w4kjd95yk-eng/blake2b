@@ -32,6 +32,24 @@ pub enum GpuBackend {
     Auto,
     Metal,
     Cuda,
+    Opencl,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenClTuning {
+    #[default]
+    Auto,
+    Off,
+    Retune,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenClKernel {
+    Baseline,
+    ScalarSplit,
+    ScalarNative,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,9 +83,11 @@ impl FromStr for GpuDevices {
         if indices.is_empty() {
             bail!("gpu_devices must be an index, a comma-separated list, or all");
         }
-        if indices.iter().enumerate().any(|(position, index)| {
-            indices[..position].contains(index)
-        }) {
+        if indices
+            .iter()
+            .enumerate()
+            .any(|(position, index)| indices[..position].contains(index))
+        {
             bail!("gpu_devices must not contain duplicate indices");
         }
         Ok(Self::Indices(indices))
@@ -127,7 +147,7 @@ pub struct Args {
     #[arg(long, value_enum)]
     pub device: Option<DeviceMode>,
 
-    /// GPU implementation: auto, metal, or cuda.
+    /// GPU implementation: auto, metal, cuda, or opencl.
     #[arg(long, value_enum)]
     pub gpu_backend: Option<GpuBackend>,
 
@@ -135,13 +155,33 @@ pub struct Args {
     #[arg(long)]
     pub gpu_devices: Option<GpuDevices>,
 
-    /// Nonces dispatched in each Metal command buffer.
+    /// Nonces dispatched in each GPU batch.
     #[arg(long)]
     pub gpu_batch_size: Option<u32>,
+
+    /// OpenCL kernel/work-group tuning policy.
+    #[arg(long, value_enum)]
+    pub opencl_tuning: Option<OpenClTuning>,
+
+    /// Force an OpenCL kernel implementation instead of selecting it automatically.
+    #[arg(long, value_enum)]
+    pub opencl_kernel: Option<OpenClKernel>,
+
+    /// Force an OpenCL local work-group size instead of selecting it automatically.
+    #[arg(long)]
+    pub opencl_local_size: Option<usize>,
+
+    /// Force the number of nonces computed by each OpenCL work-item.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
+    pub opencl_nonces_per_item: Option<u32>,
 
     /// Hash locally instead of connecting to a pool.
     #[arg(long)]
     pub benchmark: bool,
+
+    /// Duration of a local benchmark in seconds.
+    #[arg(long, default_value_t = 3)]
+    pub benchmark_seconds: u64,
 
     /// List usable GPU devices and exit without connecting to Stratum.
     #[arg(long)]
@@ -160,6 +200,10 @@ struct FileConfig {
     gpu_backend: Option<GpuBackend>,
     gpu_devices: Option<GpuDevices>,
     gpu_batch_size: Option<u32>,
+    opencl_tuning: Option<OpenClTuning>,
+    opencl_kernel: Option<OpenClKernel>,
+    opencl_local_size: Option<usize>,
+    opencl_nonces_per_item: Option<u32>,
     reconnect_delay_seconds: Option<u64>,
     stats_interval_seconds: Option<u64>,
 }
@@ -175,9 +219,14 @@ pub struct Config {
     pub gpu_backend: GpuBackend,
     pub gpu_devices: GpuDevices,
     pub gpu_batch_size: u32,
+    pub opencl_tuning: OpenClTuning,
+    pub opencl_kernel: Option<OpenClKernel>,
+    pub opencl_local_size: Option<usize>,
+    pub opencl_nonces_per_item: Option<u32>,
     pub reconnect_delay: Duration,
     pub stats_interval: Duration,
     pub benchmark: bool,
+    pub benchmark_duration: Duration,
     pub list_devices: bool,
 }
 
@@ -250,6 +299,13 @@ pub fn load(args: Args) -> Result<Config> {
     if gpu_batch_size == 0 {
         bail!("gpu_batch_size must be greater than zero");
     }
+    let opencl_local_size = args.opencl_local_size.or(file.opencl_local_size);
+    if opencl_local_size == Some(0) {
+        bail!("opencl_local_size must be greater than zero");
+    }
+    if args.benchmark_seconds == 0 {
+        bail!("benchmark_seconds must be greater than zero");
+    }
 
     Ok(Config {
         endpoint: url.endpoint,
@@ -261,9 +317,17 @@ pub fn load(args: Args) -> Result<Config> {
         gpu_backend,
         gpu_devices,
         gpu_batch_size,
+        opencl_tuning: args
+            .opencl_tuning
+            .or(file.opencl_tuning)
+            .unwrap_or_default(),
+        opencl_kernel: args.opencl_kernel.or(file.opencl_kernel),
+        opencl_local_size,
+        opencl_nonces_per_item: args.opencl_nonces_per_item.or(file.opencl_nonces_per_item),
         reconnect_delay: Duration::from_secs(file.reconnect_delay_seconds.unwrap_or(5)),
         stats_interval: Duration::from_secs(file.stats_interval_seconds.unwrap_or(5).max(1)),
         benchmark: args.benchmark,
+        benchmark_duration: Duration::from_secs(args.benchmark_seconds),
         list_devices: args.list_devices,
     })
 }
@@ -358,12 +422,22 @@ mod tests {
             "--config=missing-test-config.yaml",
             "--device=gpu",
             "--gpu-batch-size=65536",
+            "--opencl-tuning=retune",
+            "--opencl-kernel=scalar-split",
+            "--opencl-local-size=128",
+            "--opencl-nonces-per-item=2",
+            "--benchmark-seconds=30",
         ])
         .unwrap();
         let config = load(args).unwrap();
 
         assert_eq!(config.device, DeviceMode::Gpu);
         assert_eq!(config.gpu_batch_size, 65_536);
+        assert_eq!(config.opencl_tuning, OpenClTuning::Retune);
+        assert_eq!(config.opencl_kernel, Some(OpenClKernel::ScalarSplit));
+        assert_eq!(config.opencl_local_size, Some(128));
+        assert_eq!(config.opencl_nonces_per_item, Some(2));
+        assert_eq!(config.benchmark_duration, Duration::from_secs(30));
     }
 
     #[test]
@@ -407,13 +481,13 @@ mod tests {
             "miner",
             "--list-devices",
             "--config=missing-test-config.yaml",
-            "--gpu-backend=cuda",
+            "--gpu-backend=opencl",
             "--gpu-devices=0,2",
         ])
         .unwrap();
         let config = load(args).unwrap();
 
-        assert_eq!(config.gpu_backend, GpuBackend::Cuda);
+        assert_eq!(config.gpu_backend, GpuBackend::Opencl);
         assert_eq!(config.gpu_devices, GpuDevices::Indices(vec![0, 2]));
         assert!(config.list_devices);
     }
