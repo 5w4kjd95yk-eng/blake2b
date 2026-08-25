@@ -390,15 +390,15 @@ mod imp {
                 event.wait()?;
                 let wall_nanoseconds = u64::try_from(wall_start.elapsed().as_nanos())?;
                 if iteration >= 2 {
-                    let event_nanoseconds =
-                        event.profiling_command_end()? - event.profiling_command_start()?;
-                    let measured = if event_nanoseconds >= wall_nanoseconds / 4
-                        && event_nanoseconds <= wall_nanoseconds.saturating_mul(2)
-                    {
-                        event_nanoseconds
-                    } else {
-                        wall_nanoseconds
-                    };
+                    let measured = event
+                        .profiling_command_end()
+                        .and_then(|end| event.profiling_command_start().map(|start| end - start))
+                        .ok()
+                        .filter(|event_nanoseconds| {
+                            *event_nanoseconds >= wall_nanoseconds / 4
+                                && *event_nanoseconds <= wall_nanoseconds.saturating_mul(2)
+                        })
+                        .unwrap_or(wall_nanoseconds);
                     samples.push(measured);
                 }
             }
@@ -498,7 +498,8 @@ mod imp {
         }
 
         let queue = CommandQueue::create_default(context, CL_QUEUE_PROFILING_ENABLE)
-            .context("create OpenCL profiling queue")?;
+            .or_else(|_| CommandQueue::create_default(context, 0))
+            .context("create OpenCL tuning queue")?;
         let mut scratch = TuningScratch::new(context)?;
         let variants = options.kernel.map_or_else(
             || {
