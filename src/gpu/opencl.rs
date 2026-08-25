@@ -1,6 +1,6 @@
 #[cfg(feature = "opencl")]
 mod imp {
-    use std::ptr;
+    use std::{mem::size_of, ptr};
 
     use anyhow::{bail, Context as _, Result};
     use opencl3::{
@@ -10,7 +10,7 @@ mod imp {
         kernel::{ExecuteKernel, Kernel},
         memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY},
         program::Program,
-        types::CL_BLOCKING,
+        types::{CL_BLOCKING, CL_NON_BLOCKING},
     };
 
     use super::super::OpenClOptions;
@@ -81,10 +81,11 @@ mod imp {
     struct OpenClJob {
         words: [u64; 16],
         target_prefix: u64,
+        generation: u64,
     }
 
     impl OpenClJob {
-        fn new(spec: &JobSpec) -> Result<Self> {
+        fn new(spec: &JobSpec, generation: u64) -> Result<Self> {
             if spec.blob.len() != 80 {
                 bail!(
                     "DATUM OpenCL backend requires an 80-byte ASIC input, got {} bytes",
@@ -100,6 +101,7 @@ mod imp {
             Ok(Self {
                 words,
                 target_prefix: spec.target.words_be()[0],
+                generation,
             })
         }
     }
@@ -113,6 +115,7 @@ mod imp {
         results: Buffer<u64>,
         batch_size: u64,
         selection: KernelSelection,
+        loaded_generation: Option<u64>,
     }
 
     impl OpenClBackend {
@@ -171,6 +174,7 @@ mod imp {
                 results,
                 batch_size: u64::from(batch_size),
                 selection,
+                loaded_generation: None,
             })
         }
     }
@@ -184,8 +188,8 @@ mod imp {
             self.batch_size
         }
 
-        fn prepare_job(&self, spec: &JobSpec, _generation: u64) -> Result<Box<dyn PreparedJob>> {
-            Ok(Box::new(OpenClJob::new(spec)?))
+        fn prepare_job(&self, spec: &JobSpec, generation: u64) -> Result<Box<dyn PreparedJob>> {
+            Ok(Box::new(OpenClJob::new(spec, generation)?))
         }
 
         fn mine(&mut self, job: &dyn PreparedJob, start_nonce: u64) -> Result<Vec<u64>> {
@@ -193,20 +197,22 @@ mod imp {
                 .as_any()
                 .downcast_ref::<OpenClJob>()
                 .context("prepared job does not belong to the OpenCL backend")?;
-            let counters = [0u32; 2];
             unsafe {
-                self.queue.enqueue_write_buffer(
-                    &mut self.words,
-                    CL_BLOCKING,
-                    0,
-                    &job.words,
-                    &[],
-                )?;
-                self.queue.enqueue_write_buffer(
+                if self.loaded_generation != Some(job.generation) {
+                    self.queue.enqueue_write_buffer(
+                        &mut self.words,
+                        CL_NON_BLOCKING,
+                        0,
+                        &job.words,
+                        &[],
+                    )?;
+                    self.loaded_generation = Some(job.generation);
+                }
+                self.queue.enqueue_fill_buffer(
                     &mut self.counters,
-                    CL_BLOCKING,
+                    &[0u32],
                     0,
-                    &counters,
+                    size_of::<[u32; 2]>(),
                     &[],
                 )?;
                 let work_items = self
@@ -233,7 +239,7 @@ mod imp {
                 if let Some(local_size) = self.selection.local_size {
                     execution.set_local_work_size(local_size);
                 }
-                execution.enqueue_nd_range(&self.queue)?.wait()?;
+                execution.enqueue_nd_range(&self.queue)?;
             }
             let mut summary = [0u32; 2];
             unsafe {
