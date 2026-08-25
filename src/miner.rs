@@ -657,7 +657,7 @@ fn benchmark(config: &Config) -> Result<()> {
             shares,
         },
     )?;
-    let duration = Duration::from_secs(3);
+    let duration = config.benchmark_duration;
     let start = Instant::now();
     thread::sleep(duration);
     stop.store(true, Ordering::Release);
