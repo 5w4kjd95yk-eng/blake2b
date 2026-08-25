@@ -171,6 +171,10 @@ pub struct Args {
     #[arg(long)]
     pub opencl_local_size: Option<usize>,
 
+    /// Force the number of nonces computed by each OpenCL work-item.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
+    pub opencl_nonces_per_item: Option<u32>,
+
     /// Hash locally instead of connecting to a pool.
     #[arg(long)]
     pub benchmark: bool,
@@ -199,6 +203,7 @@ struct FileConfig {
     opencl_tuning: Option<OpenClTuning>,
     opencl_kernel: Option<OpenClKernel>,
     opencl_local_size: Option<usize>,
+    opencl_nonces_per_item: Option<u32>,
     reconnect_delay_seconds: Option<u64>,
     stats_interval_seconds: Option<u64>,
 }
@@ -217,6 +222,7 @@ pub struct Config {
     pub opencl_tuning: OpenClTuning,
     pub opencl_kernel: Option<OpenClKernel>,
     pub opencl_local_size: Option<usize>,
+    pub opencl_nonces_per_item: Option<u32>,
     pub reconnect_delay: Duration,
     pub stats_interval: Duration,
     pub benchmark: bool,
@@ -317,6 +323,7 @@ pub fn load(args: Args) -> Result<Config> {
             .unwrap_or_default(),
         opencl_kernel: args.opencl_kernel.or(file.opencl_kernel),
         opencl_local_size,
+        opencl_nonces_per_item: args.opencl_nonces_per_item.or(file.opencl_nonces_per_item),
         reconnect_delay: Duration::from_secs(file.reconnect_delay_seconds.unwrap_or(5)),
         stats_interval: Duration::from_secs(file.stats_interval_seconds.unwrap_or(5).max(1)),
         benchmark: args.benchmark,
@@ -418,6 +425,7 @@ mod tests {
             "--opencl-tuning=retune",
             "--opencl-kernel=scalar-split",
             "--opencl-local-size=128",
+            "--opencl-nonces-per-item=2",
             "--benchmark-seconds=30",
         ])
         .unwrap();
@@ -428,6 +436,7 @@ mod tests {
         assert_eq!(config.opencl_tuning, OpenClTuning::Retune);
         assert_eq!(config.opencl_kernel, Some(OpenClKernel::ScalarSplit));
         assert_eq!(config.opencl_local_size, Some(128));
+        assert_eq!(config.opencl_nonces_per_item, Some(2));
         assert_eq!(config.benchmark_duration, Duration::from_secs(30));
     }
 

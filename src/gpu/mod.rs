@@ -3,9 +3,28 @@ use std::any::Any;
 use anyhow::{bail, Result};
 
 use crate::{
-    config::{GpuBackend, GpuDevices},
+    config::{GpuBackend, GpuDevices, OpenClKernel, OpenClTuning},
     protocol::JobSpec,
 };
+
+#[derive(Clone, Copy, Debug)]
+pub struct OpenClOptions {
+    pub tuning: OpenClTuning,
+    pub kernel: Option<OpenClKernel>,
+    pub local_size: Option<usize>,
+    pub nonces_per_item: Option<u32>,
+}
+
+impl Default for OpenClOptions {
+    fn default() -> Self {
+        Self {
+            tuning: OpenClTuning::Auto,
+            kernel: None,
+            local_size: None,
+            nonces_per_item: None,
+        }
+    }
+}
 
 mod cuda;
 mod metal;
@@ -61,6 +80,7 @@ pub fn backends(
     requested: GpuBackend,
     selected: &GpuDevices,
     batch_size: u32,
+    opencl_options: OpenClOptions,
 ) -> Result<Vec<Box<dyn Backend>>> {
     match resolve_backend(requested)? {
         GpuBackend::Metal => {
@@ -81,7 +101,7 @@ pub fn backends(
             let available = opencl::devices()?;
             selected_indices(selected, available.len())?
                 .into_iter()
-                .map(|index| opencl::backend(index, batch_size))
+                .map(|index| opencl::backend(index, batch_size, opencl_options))
                 .collect()
         }
         GpuBackend::Auto => unreachable!(),
@@ -133,9 +153,13 @@ mod tests {
 
     #[test]
     fn metal_matches_reference_for_datum_layout() {
-        let Ok(mut backend) = backends(GpuBackend::Metal, &GpuDevices::default(), 1_024)
-            .map(|mut backends| backends.remove(0))
-        else {
+        let Ok(mut backend) = backends(
+            GpuBackend::Metal,
+            &GpuDevices::default(),
+            1_024,
+            OpenClOptions::default(),
+        )
+        .map(|mut backends| backends.remove(0)) else {
             eprintln!("skipping Metal test because no GPU is exposed");
             return;
         };
