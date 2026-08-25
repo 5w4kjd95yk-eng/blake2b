@@ -8,8 +8,8 @@ CPU and GPU workers reserve disjoint nonce ranges from the same job.
 The GPU worker uses a backend-neutral synchronous interface for device
 identity, job preparation, batch dispatch, and candidate collection. Metal,
 CUDA, and OpenCL implementations are available. CUDA and OpenCL are opt-in and
-are not required by default builds. The OpenCL implementation is a portable
-reference backend whose split 64-bit rotation core is adapted from the tuned
+are not required by default builds. The OpenCL implementation is a portable,
+auto-tuned backend whose split 64-bit rotation core is adapted from the tuned
 [sgminer-blake2b Sia kernel](https://github.com/zhq1/sgminer-blake2b/blob/master/kernel/sia.cl).
 
 Rust fits this job. It exposes AArch64 intrinsics without requiring assembly,
@@ -37,6 +37,16 @@ OpenCL builds load the system OpenCL implementation at runtime:
 ```sh
 cargo build --release --features opencl
 ```
+
+The DATUM OpenCL backend validates and briefly profiles portable OpenCL C 1.2
+kernel and work-group candidates the first time it sees a device/driver/kernel
+combination. The winner is cached in the platform user cache directory and is
+reused without retuning on later starts. Use `--opencl-tuning=retune` after a
+hardware change, or `--opencl-tuning=off` for the conservative portable
+fallback. `--opencl-kernel`, `--opencl-nonces-per-item`, and
+`--opencl-local-size` provide diagnostic overrides.
+On macOS the cache is `~/Library/Caches/blake2b-miner/opencl-tuning.json`; on
+Linux it is under `$XDG_CACHE_HOME` or `~/.cache`.
 
 ## Configuration
 
@@ -115,6 +125,20 @@ Run a three-second local benchmark without connecting to a pool:
 ```sh
 target/release/blake2b-miner --benchmark --device both
 ```
+
+Set a longer duration when tuning OpenCL without involving another backend:
+
+```sh
+target/release/blake2b-miner \
+  --benchmark --benchmark-seconds=30 \
+  --device=gpu --gpu-backend=opencl
+```
+
+On the Apple M4 used for this tuning pass, the 30-second OpenCL-only result at
+a 16,777,216-nonce batch improved from 453.5 MH/s to 460.1 MH/s. At the default
+1,048,576-nonce batch, eliminating per-batch synchronization overhead improved
+the result from 341.5 MH/s to 409.9 MH/s. These figures are device-specific;
+other OpenCL devices select and cache their own launch parameters.
 
 ## Wire format
 
