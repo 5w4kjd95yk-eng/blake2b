@@ -838,6 +838,7 @@ mod tests {
             id: "opencl-test".to_owned(),
             blob,
             target: target.clone(),
+            network_target: None,
             extra_nonce2: "0000000000000000".to_owned(),
             ntime: "0000000000000000".to_owned(),
         };
