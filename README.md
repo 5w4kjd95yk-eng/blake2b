@@ -22,7 +22,13 @@ in the hash loop.
 cargo build --release
 ```
 
-CUDA-enabled Linux builds require a CUDA toolkit with `nvcc`:
+This automatically includes Metal on macOS, OpenCL through its dynamic runtime
+loader, and CUDA on native Linux builds when a CUDA toolkit containing `nvcc`
+is found. CPU mining is always available. GPU devices and drivers are detected
+when the miner starts.
+
+Use the `cuda` feature to require CUDA support instead of silently omitting it
+when the toolkit is absent or unusable:
 
 ```sh
 cargo build --release --features cuda
@@ -32,7 +38,12 @@ cargo build --release --features cuda
 `CUDA_ARCHITECTURES` to a comma-separated compute capability list, for example
 `75,86,89`. The default is `75,80,86,89`.
 
-OpenCL builds load the system OpenCL implementation at runtime:
+`BLAKE2B_CUDA=off`, `auto`, or `force` explicitly controls CUDA detection and
+overrides the feature-derived mode. Automatic CUDA detection is disabled while
+cross-compiling. Use `--no-default-features` for a CPU-only build.
+
+OpenCL is included by default and loads the system implementation at runtime.
+It can also be selected explicitly when default features are disabled:
 
 ```sh
 cargo build --release --features opencl
