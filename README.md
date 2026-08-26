@@ -32,6 +32,24 @@ cargo build --release --features cuda
 `CUDA_ARCHITECTURES` to a comma-separated compute capability list, for example
 `75,86,89`. The default is `75,80,86,89`.
 
+The CUDA backend keeps the original reference kernel and launch geometry as
+the default. Experimental DATUM kernels can be selected explicitly for
+correctness checks and controlled benchmarking:
+
+```sh
+target/release/blake2b-miner \
+  --benchmark --device=gpu --gpu-backend=cuda \
+  --cuda-kernel=scalar-permute-precompute \
+  --cuda-nonces-per-thread=2 --cuda-block-size=128
+```
+
+`--cuda-kernel` accepts `reference`, `scalar`, `scalar-permute`, and
+`scalar-permute-precompute`. Nonces per thread may be 1, 2, or 4; block size
+must be a multiple of 32 from 32 through 1024. The same settings may be placed
+in YAML as `cuda_kernel`, `cuda_nonces_per_thread`, and `cuda_block_size`.
+The selected kernel and launch geometry are printed when the CUDA backend is
+created. These overrides do not affect Metal or OpenCL.
+
 OpenCL builds load the system OpenCL implementation at runtime:
 
 ```sh
