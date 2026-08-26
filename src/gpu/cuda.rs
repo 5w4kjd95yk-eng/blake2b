@@ -1,4 +1,4 @@
-#[cfg(feature = "cuda")]
+#[cfg(blake2b_cuda)]
 mod imp {
     use std::{
         ffi::{c_char, c_int, c_void, CStr},
@@ -299,35 +299,35 @@ mod imp {
     }
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(blake2b_cuda))]
 mod imp {
     use anyhow::{bail, Result};
 
     use super::super::{Backend, DeviceInfo};
 
     pub fn devices() -> Result<Vec<DeviceInfo>> {
-        bail!("CUDA support is not compiled in; rebuild with --features cuda")
+        bail!("CUDA support is not compiled in; install a CUDA toolkit and rebuild")
     }
 
     pub fn backend(_index: usize, _batch_size: u32) -> Result<Box<dyn Backend>> {
-        bail!("CUDA support is not compiled in; rebuild with --features cuda")
+        bail!("CUDA support is not compiled in; install a CUDA toolkit and rebuild")
     }
 }
 
 pub use imp::devices;
 
 pub fn backend(index: usize, batch_size: u32) -> anyhow::Result<Box<dyn super::Backend>> {
-    #[cfg(feature = "cuda")]
+    #[cfg(blake2b_cuda)]
     {
         Ok(Box::new(imp::CudaBackend::new(index, batch_size)?))
     }
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(blake2b_cuda))]
     {
         imp::backend(index, batch_size)
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(all(test, blake2b_cuda))]
 mod tests {
     use super::imp::{devices, CudaBackend};
     use crate::{gpu::Backend, hash::blake2b256, protocol::JobSpec, target::Target};

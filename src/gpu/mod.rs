@@ -112,7 +112,7 @@ fn resolve_backend(requested: GpuBackend) -> Result<GpuBackend> {
     match requested {
         GpuBackend::Auto if cfg!(target_os = "macos") => Ok(GpuBackend::Metal),
         GpuBackend::Auto => {
-            #[cfg(all(target_os = "linux", feature = "cuda"))]
+            #[cfg(blake2b_cuda)]
             if cuda::devices().is_ok_and(|devices| !devices.is_empty()) {
                 return Ok(GpuBackend::Cuda);
             }
