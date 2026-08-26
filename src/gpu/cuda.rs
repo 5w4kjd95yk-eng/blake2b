@@ -218,6 +218,16 @@ mod imp {
 
     impl CudaBackend {
         pub fn new(index: usize, batch_size: u32, options: CudaOptions) -> Result<Self> {
+            if batch_size == 0 {
+                bail!("CUDA batch size must be greater than zero");
+            }
+            if !matches!(options.nonces_per_thread, 1 | 2 | 4) {
+                bail!("CUDA nonces per thread must be 1, 2, or 4");
+            }
+            if !(32..=1024).contains(&options.block_size) || !options.block_size.is_multiple_of(32)
+            {
+                bail!("CUDA block size must be a multiple of 32 from 32 through 1024");
+            }
             let device = devices()?
                 .into_iter()
                 .find(|device| device.index == index)
@@ -409,6 +419,25 @@ mod tests {
     };
 
     const TEST_NONCES: u32 = 35;
+
+    #[test]
+    fn rejects_invalid_launch_options_before_device_access() {
+        for options in [
+            CudaOptions {
+                kernel: CudaKernel::Reference,
+                nonces_per_thread: 3,
+                block_size: 256,
+            },
+            CudaOptions {
+                kernel: CudaKernel::Reference,
+                nonces_per_thread: 1,
+                block_size: 48,
+            },
+        ] {
+            assert!(CudaBackend::new(0, TEST_NONCES, options).is_err());
+        }
+        assert!(CudaBackend::new(0, 0, CudaOptions::default()).is_err());
+    }
 
     #[test]
     fn datum_kernel_matches_rust_at_full_nonce_boundaries() {
