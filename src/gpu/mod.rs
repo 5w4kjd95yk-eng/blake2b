@@ -3,9 +3,26 @@ use std::any::Any;
 use anyhow::{bail, Result};
 
 use crate::{
-    config::{GpuBackend, GpuDevices, OpenClKernel, OpenClTuning},
+    config::{CudaKernel, GpuBackend, GpuDevices, OpenClKernel, OpenClTuning},
     protocol::JobSpec,
 };
+
+#[derive(Clone, Copy, Debug)]
+pub struct CudaOptions {
+    pub kernel: CudaKernel,
+    pub nonces_per_thread: u32,
+    pub block_size: u32,
+}
+
+impl Default for CudaOptions {
+    fn default() -> Self {
+        Self {
+            kernel: CudaKernel::Reference,
+            nonces_per_thread: 1,
+            block_size: 256,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct OpenClOptions {
@@ -80,6 +97,7 @@ pub fn backends(
     requested: GpuBackend,
     selected: &GpuDevices,
     batch_size: u32,
+    cuda_options: CudaOptions,
     opencl_options: OpenClOptions,
 ) -> Result<Vec<Box<dyn Backend>>> {
     match resolve_backend(requested)? {
@@ -94,7 +112,7 @@ pub fn backends(
             let available = cuda::devices()?;
             selected_indices(selected, available.len())?
                 .into_iter()
-                .map(|index| cuda::backend(index, batch_size))
+                .map(|index| cuda::backend(index, batch_size, cuda_options))
                 .collect()
         }
         GpuBackend::Opencl => {

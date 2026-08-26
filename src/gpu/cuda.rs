@@ -7,7 +7,7 @@ mod imp {
 
     use anyhow::{bail, Context as _, Result};
 
-    use super::super::{Backend, DeviceInfo, PreparedJob};
+    use super::super::{Backend, CudaOptions, DeviceInfo, PreparedJob};
     use crate::protocol::JobSpec;
 
     #[repr(C)]
@@ -206,7 +206,7 @@ mod imp {
     }
 
     impl CudaBackend {
-        pub fn new(index: usize, batch_size: u32) -> Result<Self> {
+        pub fn new(index: usize, batch_size: u32, _options: CudaOptions) -> Result<Self> {
             let device = devices()?
                 .into_iter()
                 .find(|device| device.index == index)
@@ -309,21 +309,29 @@ mod imp {
         bail!("CUDA support is not compiled in; rebuild with --features cuda")
     }
 
-    pub fn backend(_index: usize, _batch_size: u32) -> Result<Box<dyn Backend>> {
+    pub fn backend(
+        _index: usize,
+        _batch_size: u32,
+        _options: super::super::CudaOptions,
+    ) -> Result<Box<dyn Backend>> {
         bail!("CUDA support is not compiled in; rebuild with --features cuda")
     }
 }
 
 pub use imp::devices;
 
-pub fn backend(index: usize, batch_size: u32) -> anyhow::Result<Box<dyn super::Backend>> {
+pub fn backend(
+    index: usize,
+    batch_size: u32,
+    options: super::CudaOptions,
+) -> anyhow::Result<Box<dyn super::Backend>> {
     #[cfg(feature = "cuda")]
     {
-        Ok(Box::new(imp::CudaBackend::new(index, batch_size)?))
+        Ok(Box::new(imp::CudaBackend::new(index, batch_size, options)?))
     }
     #[cfg(not(feature = "cuda"))]
     {
-        imp::backend(index, batch_size)
+        imp::backend(index, batch_size, options)
     }
 }
 
@@ -376,7 +384,8 @@ mod tests {
             let target =
                 Target::from_hex(&format!("{selected_prefix:016x}{}", "00".repeat(24))).unwrap();
             let spec = job(blob, target);
-            let mut backend = CudaBackend::new(device.index, TEST_NONCES).unwrap();
+            let mut backend =
+                CudaBackend::new(device.index, TEST_NONCES, Default::default()).unwrap();
             let prepared = backend.prepare_job(&spec, case as u64 + 1).unwrap();
             let mut actual = backend.mine(prepared.as_ref(), start_nonce).unwrap();
             let mut expected = hashes
@@ -408,7 +417,7 @@ mod tests {
             return;
         };
         let spec = job([0x5a; 80], Target::from_hex(&"ff".repeat(32)).unwrap());
-        let mut backend = CudaBackend::new(device.index, 257).unwrap();
+        let mut backend = CudaBackend::new(device.index, 257, Default::default()).unwrap();
         let prepared = backend.prepare_job(&spec, 99).unwrap();
         let error = backend.mine(prepared.as_ref(), 0).unwrap_err();
         assert!(error.to_string().contains("result buffer overflow"));
