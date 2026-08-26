@@ -383,6 +383,7 @@ fn flush_hashes(hashes: &AtomicU64, pending: &mut u64) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_session(
     config: &Config,
     current: &ArcSwapOption<Work>,
