@@ -22,12 +22,15 @@ mod imp {
     #[repr(C)]
     struct NativeJobParams {
         words: [u64; 10],
+        precomputed_v: [u64; 16],
         start_nonce: u64,
         nonce_count: u64,
         target_prefix: u64,
         generation: u64,
         result_capacity: u32,
-        reserved: u32,
+        kernel_variant: u32,
+        nonces_per_thread: u32,
+        block_size: u32,
     }
 
     #[repr(C)]
@@ -37,6 +40,11 @@ mod imp {
         overflow: u32,
         generation: u64,
     }
+
+    const _: () = assert!(std::mem::size_of::<NativeJobParams>() == 256);
+    const _: () = assert!(std::mem::offset_of!(NativeJobParams, start_nonce) == 208);
+    const _: () = assert!(std::mem::offset_of!(NativeJobParams, result_capacity) == 240);
+    const _: () = assert!(std::mem::size_of::<NativeResultSummary>() == 16);
 
     unsafe extern "C" {
         fn blake2b_cuda_device_count(count: *mut c_int) -> c_int;
@@ -163,6 +171,7 @@ mod imp {
 
     struct CudaJob {
         words: [u64; 10],
+        precomputed_v: [u64; 16],
         target_prefix: u64,
         generation: u64,
     }
@@ -180,6 +189,7 @@ mod imp {
                 *word = u64::from_le_bytes(bytes.try_into().unwrap());
             }
             Ok(Self {
+                precomputed_v: precompute_round_zero(&words),
                 words,
                 target_prefix: spec.target.words_be()[0],
                 generation,
@@ -201,21 +211,29 @@ mod imp {
     pub struct CudaBackend {
         device: DeviceInfo,
         batch_size: u64,
+        options: CudaOptions,
         miner: Miner,
         _context: Context,
     }
 
     impl CudaBackend {
-        pub fn new(index: usize, batch_size: u32, _options: CudaOptions) -> Result<Self> {
+        pub fn new(index: usize, batch_size: u32, options: CudaOptions) -> Result<Self> {
             let device = devices()?
                 .into_iter()
                 .find(|device| device.index == index)
                 .ok_or_else(|| anyhow::anyhow!("CUDA device index {index} does not exist"))?;
             let context = Context::new(index)?;
             let miner = Miner::new(&context)?;
+            let work_items = u64::from(batch_size).div_ceil(u64::from(options.nonces_per_thread));
+            let grid_size = work_items.div_ceil(u64::from(options.block_size));
+            eprintln!(
+                "CUDA kernel={:?} nonces_per_thread={} block_size={} grid_size={}",
+                options.kernel, options.nonces_per_thread, options.block_size, grid_size
+            );
             Ok(Self {
                 device,
                 batch_size: u64::from(batch_size),
+                options,
                 miner,
                 _context: context,
             })
@@ -242,12 +260,20 @@ mod imp {
                 .context("prepared job does not belong to the CUDA backend")?;
             let params = NativeJobParams {
                 words: job.words,
+                precomputed_v: job.precomputed_v,
                 start_nonce,
                 nonce_count: self.batch_size,
                 target_prefix: job.target_prefix,
                 generation: job.generation,
                 result_capacity: MAX_RESULTS as u32,
-                reserved: 0,
+                kernel_variant: match self.options.kernel {
+                    crate::config::CudaKernel::Reference => 0,
+                    crate::config::CudaKernel::Scalar => 1,
+                    crate::config::CudaKernel::ScalarPermute => 2,
+                    crate::config::CudaKernel::ScalarPermutePrecompute => 3,
+                },
+                nonces_per_thread: self.options.nonces_per_thread,
+                block_size: self.options.block_size,
             };
             let mut summary = NativeResultSummary::default();
             let mut results = vec![0; MAX_RESULTS];
@@ -297,6 +323,42 @@ mod imp {
                 .into_owned()
         }
     }
+
+    fn precompute_round_zero(words: &[u64; 10]) -> [u64; 16] {
+        let mut v = [
+            0x6a09_e667_f2bd_c928,
+            0xbb67_ae85_84ca_a73b,
+            0x3c6e_f372_fe94_f82b,
+            0xa54f_f53a_5f1d_36f1,
+            0x510e_527f_ade6_82d1,
+            0x9b05_688c_2b3e_6c1f,
+            0x1f83_d9ab_fb41_bd6b,
+            0x5be0_cd19_137e_2179,
+            0x6a09_e667_f3bc_c908,
+            0xbb67_ae85_84ca_a73b,
+            0x3c6e_f372_fe94_f82b,
+            0xa54f_f53a_5f1d_36f1,
+            0x510e_527f_ade6_82d1 ^ 80,
+            0x9b05_688c_2b3e_6c1f,
+            0xe07c_2654_04be_4294,
+            0x5be0_cd19_137e_2179,
+        ];
+        precompute_g(&mut v, 0, 4, 8, 12, words[0], words[1]);
+        precompute_g(&mut v, 1, 5, 9, 13, words[2], words[3]);
+        precompute_g(&mut v, 3, 7, 11, 15, words[6], words[7]);
+        v
+    }
+
+    fn precompute_g(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64, y: u64) {
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+        v[d] = (v[d] ^ v[a]).rotate_right(32);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(24);
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+        v[d] = (v[d] ^ v[a]).rotate_right(16);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(63);
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -338,9 +400,15 @@ pub fn backend(
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::imp::{devices, CudaBackend};
-    use crate::{gpu::Backend, hash::blake2b256, protocol::JobSpec, target::Target};
+    use crate::{
+        config::CudaKernel,
+        gpu::{Backend, CudaOptions},
+        hash::blake2b256,
+        protocol::JobSpec,
+        target::Target,
+    };
 
-    const TEST_NONCES: u32 = 32;
+    const TEST_NONCES: u32 = 35;
 
     #[test]
     fn datum_kernel_matches_rust_at_full_nonce_boundaries() {
@@ -353,56 +421,75 @@ mod tests {
             return;
         };
 
-        let starts = [
-            0,
-            u32::MAX as u64 - 15,
-            (1u64 << 32) + 0x1234_5678,
-            u64::MAX - 15,
-        ];
-        let mut random = 0x6a09_e667_f3bc_c908u64;
-        for (case, start_nonce) in starts.into_iter().enumerate() {
-            let mut blob = [0u8; 80];
-            for chunk in blob.chunks_exact_mut(8) {
-                random ^= random << 13;
-                random ^= random >> 7;
-                random ^= random << 17;
-                chunk.copy_from_slice(&random.to_le_bytes());
+        for kernel in [
+            CudaKernel::Reference,
+            CudaKernel::Scalar,
+            CudaKernel::ScalarPermute,
+            CudaKernel::ScalarPermutePrecompute,
+        ] {
+            for nonces_per_thread in [1, 2, 4] {
+                let options = CudaOptions {
+                    kernel,
+                    nonces_per_thread,
+                    block_size: 32,
+                };
+                let mut backend = CudaBackend::new(device.index, TEST_NONCES, options).unwrap();
+                let starts = [
+                    0,
+                    u32::MAX as u64 - 15,
+                    (1u64 << 32) + 0x1234_5678,
+                    u64::MAX - 15,
+                ];
+                let mut random = 0x6a09_e667_f3bc_c908u64;
+                for (case, start_nonce) in starts.into_iter().enumerate() {
+                    let mut blob = [0u8; 80];
+                    for chunk in blob.chunks_exact_mut(8) {
+                        random ^= random << 13;
+                        random ^= random >> 7;
+                        random ^= random << 17;
+                        chunk.copy_from_slice(&random.to_le_bytes());
+                    }
+                    let hashes = (0..TEST_NONCES)
+                        .map(|offset| {
+                            let nonce = start_nonce.wrapping_add(u64::from(offset));
+                            (nonce, reference_hash(blob, nonce))
+                        })
+                        .collect::<Vec<_>>();
+                    // Selecting an observed prefix explicitly exercises <= equality.
+                    let mut prefixes = hashes
+                        .iter()
+                        .map(|(nonce, hash)| {
+                            (*nonce, u64::from_be_bytes(hash[..8].try_into().unwrap()))
+                        })
+                        .collect::<Vec<_>>();
+                    prefixes.sort_unstable_by_key(|(_, prefix)| *prefix);
+                    let (equal_nonce, selected_prefix) = prefixes[TEST_NONCES as usize / 2];
+                    let target =
+                        Target::from_hex(&format!("{selected_prefix:016x}{}", "00".repeat(24)))
+                            .unwrap();
+                    let spec = job(blob, target);
+                    let prepared = backend.prepare_job(&spec, case as u64 + 1).unwrap();
+                    let mut actual = backend.mine(prepared.as_ref(), start_nonce).unwrap();
+                    let mut expected = hashes
+                        .iter()
+                        .filter_map(|(nonce, hash)| {
+                            let prefix = u64::from_be_bytes(hash[..8].try_into().unwrap());
+                            (prefix <= selected_prefix).then_some(*nonce)
+                        })
+                        .collect::<Vec<_>>();
+                    actual.sort_unstable();
+                    expected.sort_unstable();
+                    assert_eq!(
+                        actual, expected,
+                        "CUDA mismatch for {kernel:?} x{nonces_per_thread} in boundary case {case}"
+                    );
+                    assert!(actual.contains(&equal_nonce), "prefix equality was lost");
+                    assert!(
+                        hashes.iter().any(|(nonce, _)| !actual.contains(nonce)),
+                        "self-test target did not select a non-candidate"
+                    );
+                }
             }
-            let hashes = (0..TEST_NONCES)
-                .map(|offset| {
-                    let nonce = start_nonce.wrapping_add(u64::from(offset));
-                    (nonce, reference_hash(blob, nonce))
-                })
-                .collect::<Vec<_>>();
-            // Selecting an observed prefix explicitly exercises <= equality.
-            let mut prefixes = hashes
-                .iter()
-                .map(|(nonce, hash)| (*nonce, u64::from_be_bytes(hash[..8].try_into().unwrap())))
-                .collect::<Vec<_>>();
-            prefixes.sort_unstable_by_key(|(_, prefix)| *prefix);
-            let (equal_nonce, selected_prefix) = prefixes[TEST_NONCES as usize / 2];
-            let target =
-                Target::from_hex(&format!("{selected_prefix:016x}{}", "00".repeat(24))).unwrap();
-            let spec = job(blob, target);
-            let mut backend =
-                CudaBackend::new(device.index, TEST_NONCES, Default::default()).unwrap();
-            let prepared = backend.prepare_job(&spec, case as u64 + 1).unwrap();
-            let mut actual = backend.mine(prepared.as_ref(), start_nonce).unwrap();
-            let mut expected = hashes
-                .iter()
-                .filter_map(|(nonce, hash)| {
-                    let prefix = u64::from_be_bytes(hash[..8].try_into().unwrap());
-                    (prefix <= selected_prefix).then_some(*nonce)
-                })
-                .collect::<Vec<_>>();
-            actual.sort_unstable();
-            expected.sort_unstable();
-            assert_eq!(actual, expected, "CUDA mismatch in boundary case {case}");
-            assert!(actual.contains(&equal_nonce), "prefix equality was lost");
-            assert!(
-                hashes.iter().any(|(nonce, _)| !actual.contains(nonce)),
-                "self-test target did not select a non-candidate"
-            );
         }
     }
 
