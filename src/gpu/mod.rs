@@ -17,9 +17,9 @@ pub struct CudaOptions {
 impl Default for CudaOptions {
     fn default() -> Self {
         Self {
-            kernel: CudaKernel::Reference,
+            kernel: CudaKernel::Scalar,
             nonces_per_thread: 1,
-            block_size: 256,
+            block_size: 512,
         }
     }
 }

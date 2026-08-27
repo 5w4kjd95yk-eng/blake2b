@@ -55,8 +55,8 @@ pub enum OpenClKernel {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CudaKernel {
-    #[default]
     Reference,
+    #[default]
     Scalar,
     ScalarPermute,
     ScalarPermutePrecompute,
@@ -334,7 +334,7 @@ pub fn load(args: Args) -> Result<Config> {
     if !matches!(cuda_nonces_per_thread, 1 | 2 | 4) {
         bail!("cuda_nonces_per_thread must be 1, 2, or 4");
     }
-    let cuda_block_size = args.cuda_block_size.or(file.cuda_block_size).unwrap_or(256);
+    let cuda_block_size = args.cuda_block_size.or(file.cuda_block_size).unwrap_or(512);
     if !(32..=1024).contains(&cuda_block_size) || !cuda_block_size.is_multiple_of(32) {
         bail!("cuda_block_size must be a multiple of 32 from 32 through 1024");
     }
