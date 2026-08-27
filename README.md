@@ -30,7 +30,7 @@ cargo build --release --features cuda
 
 `CUDA_PATH` (or `CUDA_HOME`) overrides the toolkit root. Fleet builds can set
 `CUDA_ARCHITECTURES` to a comma-separated compute capability list, for example
-`75,86,89`. The default is `75,80,86,89`.
+`75,86,89,120`. The default is `75,80,86,89,120`.
 
 OpenCL builds load the system OpenCL implementation at runtime:
 

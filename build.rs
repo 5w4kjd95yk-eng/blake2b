@@ -63,7 +63,8 @@ fn main() {
 }
 
 fn architectures() -> Vec<String> {
-    let raw = env::var("CUDA_ARCHITECTURES").unwrap_or_else(|_| "75,80,86,89".to_owned());
+    let raw =
+        env::var("CUDA_ARCHITECTURES").unwrap_or_else(|_| "75,80,86,89,120".to_owned());
     let values = raw
         .split([',', ';', ' '])
         .filter(|value| !value.is_empty())
