@@ -32,9 +32,9 @@ cargo build --release --features cuda
 `CUDA_ARCHITECTURES` to a comma-separated compute capability list, for example
 `75,86,89,120`. The default is `75,80,86,89,120`.
 
-The CUDA backend keeps the original reference kernel and launch geometry as
-the default. Experimental DATUM kernels can be selected explicitly for
-correctness checks and controlled benchmarking:
+The CUDA backend defaults to the scalar DATUM kernel with one nonce per thread
+and 512 threads per block. The original reference kernel and other tuning
+variants remain selectable for correctness checks and controlled benchmarking:
 
 ```sh
 target/release/blake2b-miner \

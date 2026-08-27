@@ -1,8 +1,7 @@
 # CUDA Hashcat-inspired kernel variants
 
-This branch adds opt-in DATUM CUDA experiments while retaining
-`reference`, one nonce per thread, and 256 threads per block as the defaults.
-No throughput measurements were taken while developing the variants.
+This branch added opt-in DATUM CUDA experiments. Hardware measurements now
+select `scalar`, one nonce per thread, and 512 threads per block as the defaults.
 
 ## Variants
 
@@ -33,11 +32,25 @@ These figures describe compiler resource allocation, not mining performance.
 They should be collected again for the incoming GPU's actual compute
 capability before interpreting occupancy.
 
-## Hardware acceptance
+## Blackwell measurements
 
-After the shared machine is cleared for performance work, compare every
-kernel using one nonce per thread first, then test widths 2 and 4 only for
-correct variants without harmful resource use. Sweep block sizes 32, 64, 128,
-256, 512, and 1024 at both the default and large batch sizes. Alternate the
-reference and candidate runs, retain all samples, and keep the current default
-until a winner is repeatable in both the local benchmark and a live DATUM job.
+Measured on 2026-08-27 with an RTX 5070 Ti Laptop GPU (compute capability 12.0),
+CUDA 13.1, and driver 591.84. All variants passed the CUDA-to-Rust boundary
+comparison before benchmarking. A broad two-second sweep covered all kernels
+at width 1 and block sizes 32 through 1024, followed by widths 2 and 4 at block
+sizes 128, 256, and 512.
+
+Longer five-second runs alternated the current reference kernel, the strongest
+plain scalar configuration, and the strongest short-sweep result. Medians from
+three samples were:
+
+| Batch size | Reference | Scalar x1/block 512 | Permute-precompute x2/block 512 |
+| ---: | ---: | ---: | ---: |
+| 1,048,576 | 1,976.918 MH/s | 2,706.174 MH/s | 2,675.821 MH/s |
+| 16,777,216 | 2,285.942 MH/s | 3,474.200 MH/s | 3,353.103 MH/s |
+
+Scalar x1/block 512 improved median throughput by 36.9% at the default batch
+and 52.0% at the large batch. Width 4 generally regressed. The explicit
+permutation lowering did not improve plain scalar performance on this target,
+and the precomputed width-2 candidate was less repeatable, so scalar x1/block
+512 is the default.
