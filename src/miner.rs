@@ -101,6 +101,7 @@ pub fn run(config: Config) -> Result<()> {
             config.gpu_backend,
             &config.gpu_devices,
             config.gpu_batch_size,
+            cuda_options(&config),
             opencl_options(&config),
         )?;
         for backend in &backends {
@@ -218,6 +219,14 @@ fn opencl_options(config: &Config) -> gpu::OpenClOptions {
         kernel: config.opencl_kernel,
         local_size: config.opencl_local_size,
         nonces_per_item: config.opencl_nonces_per_item,
+    }
+}
+
+fn cuda_options(config: &Config) -> gpu::CudaOptions {
+    gpu::CudaOptions {
+        kernel: config.cuda_kernel,
+        nonces_per_thread: config.cuda_nonces_per_thread,
+        block_size: config.cuda_block_size,
     }
 }
 
@@ -374,6 +383,7 @@ fn flush_hashes(hashes: &AtomicU64, pending: &mut u64) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_session(
     config: &Config,
     current: &ArcSwapOption<Work>,
@@ -763,6 +773,7 @@ fn benchmark(config: &Config) -> Result<()> {
             config.gpu_backend,
             &config.gpu_devices,
             config.gpu_batch_size,
+            cuda_options(config),
             opencl_options(config),
         )?;
         for backend in &backends {

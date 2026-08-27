@@ -52,6 +52,16 @@ pub enum OpenClKernel {
     ScalarNative,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CudaKernel {
+    #[default]
+    Reference,
+    Scalar,
+    ScalarPermute,
+    ScalarPermutePrecompute,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GpuDevices {
     All,
@@ -159,6 +169,18 @@ pub struct Args {
     #[arg(long)]
     pub gpu_batch_size: Option<u32>,
 
+    /// Select the experimental CUDA DATUM kernel implementation.
+    #[arg(long, value_enum)]
+    pub cuda_kernel: Option<CudaKernel>,
+
+    /// Number of sequential nonces computed by each CUDA thread.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
+    pub cuda_nonces_per_thread: Option<u32>,
+
+    /// CUDA threads per block; must be a warp-sized multiple.
+    #[arg(long)]
+    pub cuda_block_size: Option<u32>,
+
     /// OpenCL kernel/work-group tuning policy.
     #[arg(long, value_enum)]
     pub opencl_tuning: Option<OpenClTuning>,
@@ -200,6 +222,9 @@ struct FileConfig {
     gpu_backend: Option<GpuBackend>,
     gpu_devices: Option<GpuDevices>,
     gpu_batch_size: Option<u32>,
+    cuda_kernel: Option<CudaKernel>,
+    cuda_nonces_per_thread: Option<u32>,
+    cuda_block_size: Option<u32>,
     opencl_tuning: Option<OpenClTuning>,
     opencl_kernel: Option<OpenClKernel>,
     opencl_local_size: Option<usize>,
@@ -219,6 +244,9 @@ pub struct Config {
     pub gpu_backend: GpuBackend,
     pub gpu_devices: GpuDevices,
     pub gpu_batch_size: u32,
+    pub cuda_kernel: CudaKernel,
+    pub cuda_nonces_per_thread: u32,
+    pub cuda_block_size: u32,
     pub opencl_tuning: OpenClTuning,
     pub opencl_kernel: Option<OpenClKernel>,
     pub opencl_local_size: Option<usize>,
@@ -299,6 +327,17 @@ pub fn load(args: Args) -> Result<Config> {
     if gpu_batch_size == 0 {
         bail!("gpu_batch_size must be greater than zero");
     }
+    let cuda_nonces_per_thread = args
+        .cuda_nonces_per_thread
+        .or(file.cuda_nonces_per_thread)
+        .unwrap_or(1);
+    if !matches!(cuda_nonces_per_thread, 1 | 2 | 4) {
+        bail!("cuda_nonces_per_thread must be 1, 2, or 4");
+    }
+    let cuda_block_size = args.cuda_block_size.or(file.cuda_block_size).unwrap_or(256);
+    if !(32..=1024).contains(&cuda_block_size) || !cuda_block_size.is_multiple_of(32) {
+        bail!("cuda_block_size must be a multiple of 32 from 32 through 1024");
+    }
     let opencl_local_size = args.opencl_local_size.or(file.opencl_local_size);
     if opencl_local_size == Some(0) {
         bail!("opencl_local_size must be greater than zero");
@@ -317,6 +356,9 @@ pub fn load(args: Args) -> Result<Config> {
         gpu_backend,
         gpu_devices,
         gpu_batch_size,
+        cuda_kernel: args.cuda_kernel.or(file.cuda_kernel).unwrap_or_default(),
+        cuda_nonces_per_thread,
+        cuda_block_size,
         opencl_tuning: args
             .opencl_tuning
             .or(file.opencl_tuning)
@@ -422,6 +464,9 @@ mod tests {
             "--config=missing-test-config.yaml",
             "--device=gpu",
             "--gpu-batch-size=65536",
+            "--cuda-kernel=scalar-permute-precompute",
+            "--cuda-nonces-per-thread=4",
+            "--cuda-block-size=128",
             "--opencl-tuning=retune",
             "--opencl-kernel=scalar-split",
             "--opencl-local-size=128",
@@ -433,11 +478,34 @@ mod tests {
 
         assert_eq!(config.device, DeviceMode::Gpu);
         assert_eq!(config.gpu_batch_size, 65_536);
+        assert_eq!(config.cuda_kernel, CudaKernel::ScalarPermutePrecompute);
+        assert_eq!(config.cuda_nonces_per_thread, 4);
+        assert_eq!(config.cuda_block_size, 128);
         assert_eq!(config.opencl_tuning, OpenClTuning::Retune);
         assert_eq!(config.opencl_kernel, Some(OpenClKernel::ScalarSplit));
         assert_eq!(config.opencl_local_size, Some(128));
         assert_eq!(config.opencl_nonces_per_item, Some(2));
         assert_eq!(config.benchmark_duration, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn validates_cuda_launch_options() {
+        for arguments in [
+            ["--cuda-nonces-per-thread=3", "--cuda-block-size=256"],
+            ["--cuda-nonces-per-thread=1", "--cuda-block-size=48"],
+            ["--cuda-nonces-per-thread=1", "--cuda-block-size=1056"],
+        ] {
+            let args = Args::try_parse_from([
+                "miner",
+                "--benchmark",
+                "--config=missing-test-config.yaml",
+                arguments[0],
+                arguments[1],
+            ]);
+            if let Ok(args) = args {
+                assert!(load(args).is_err());
+            }
+        }
     }
 
     #[test]
