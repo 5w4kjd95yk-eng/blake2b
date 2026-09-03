@@ -175,6 +175,7 @@ mod tests {
             GpuBackend::Metal,
             &GpuDevices::default(),
             1_024,
+            CudaOptions::default(),
             OpenClOptions::default(),
         )
         .map(|mut backends| backends.remove(0)) else {
