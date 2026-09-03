@@ -44,6 +44,23 @@ pub enum OpenClTuning {
     Retune,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MetalTuning {
+    #[default]
+    Auto,
+    Off,
+    Retune,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MetalKernel {
+    Baseline,
+    ScalarSplit,
+    ScalarNative,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum OpenClKernel {
@@ -169,6 +186,22 @@ pub struct Args {
     #[arg(long)]
     pub gpu_batch_size: Option<u32>,
 
+    /// Metal kernel/threadgroup tuning policy.
+    #[arg(long, value_enum)]
+    pub metal_tuning: Option<MetalTuning>,
+
+    /// Force a Metal kernel implementation instead of selecting it automatically.
+    #[arg(long, value_enum)]
+    pub metal_kernel: Option<MetalKernel>,
+
+    /// Force the number of sequential nonces computed by each Metal thread.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
+    pub metal_nonces_per_thread: Option<u32>,
+
+    /// Force the Metal threads per threadgroup.
+    #[arg(long)]
+    pub metal_threadgroup_size: Option<usize>,
+
     /// Select the experimental CUDA DATUM kernel implementation.
     #[arg(long, value_enum)]
     pub cuda_kernel: Option<CudaKernel>,
@@ -222,6 +255,10 @@ struct FileConfig {
     gpu_backend: Option<GpuBackend>,
     gpu_devices: Option<GpuDevices>,
     gpu_batch_size: Option<u32>,
+    metal_tuning: Option<MetalTuning>,
+    metal_kernel: Option<MetalKernel>,
+    metal_nonces_per_thread: Option<u32>,
+    metal_threadgroup_size: Option<usize>,
     cuda_kernel: Option<CudaKernel>,
     cuda_nonces_per_thread: Option<u32>,
     cuda_block_size: Option<u32>,
@@ -244,6 +281,10 @@ pub struct Config {
     pub gpu_backend: GpuBackend,
     pub gpu_devices: GpuDevices,
     pub gpu_batch_size: u32,
+    pub metal_tuning: MetalTuning,
+    pub metal_kernel: Option<MetalKernel>,
+    pub metal_nonces_per_thread: Option<u32>,
+    pub metal_threadgroup_size: Option<usize>,
     pub cuda_kernel: CudaKernel,
     pub cuda_nonces_per_thread: u32,
     pub cuda_block_size: u32,
@@ -327,6 +368,16 @@ pub fn load(args: Args) -> Result<Config> {
     if gpu_batch_size == 0 {
         bail!("gpu_batch_size must be greater than zero");
     }
+    let metal_nonces_per_thread = args
+        .metal_nonces_per_thread
+        .or(file.metal_nonces_per_thread);
+    if metal_nonces_per_thread.is_some_and(|value| !matches!(value, 1 | 2 | 4)) {
+        bail!("metal_nonces_per_thread must be 1, 2, or 4");
+    }
+    let metal_threadgroup_size = args.metal_threadgroup_size.or(file.metal_threadgroup_size);
+    if metal_threadgroup_size == Some(0) {
+        bail!("metal_threadgroup_size must be greater than zero");
+    }
     let cuda_nonces_per_thread = args
         .cuda_nonces_per_thread
         .or(file.cuda_nonces_per_thread)
@@ -356,6 +407,10 @@ pub fn load(args: Args) -> Result<Config> {
         gpu_backend,
         gpu_devices,
         gpu_batch_size,
+        metal_tuning: args.metal_tuning.or(file.metal_tuning).unwrap_or_default(),
+        metal_kernel: args.metal_kernel.or(file.metal_kernel),
+        metal_nonces_per_thread,
+        metal_threadgroup_size,
         cuda_kernel: args.cuda_kernel.or(file.cuda_kernel).unwrap_or_default(),
         cuda_nonces_per_thread,
         cuda_block_size,
@@ -464,6 +519,10 @@ mod tests {
             "--config=missing-test-config.yaml",
             "--device=gpu",
             "--gpu-batch-size=65536",
+            "--metal-tuning=retune",
+            "--metal-kernel=scalar-native",
+            "--metal-nonces-per-thread=2",
+            "--metal-threadgroup-size=128",
             "--cuda-kernel=scalar-permute-precompute",
             "--cuda-nonces-per-thread=4",
             "--cuda-block-size=128",
@@ -478,6 +537,10 @@ mod tests {
 
         assert_eq!(config.device, DeviceMode::Gpu);
         assert_eq!(config.gpu_batch_size, 65_536);
+        assert_eq!(config.metal_tuning, MetalTuning::Retune);
+        assert_eq!(config.metal_kernel, Some(MetalKernel::ScalarNative));
+        assert_eq!(config.metal_nonces_per_thread, Some(2));
+        assert_eq!(config.metal_threadgroup_size, Some(128));
         assert_eq!(config.cuda_kernel, CudaKernel::ScalarPermutePrecompute);
         assert_eq!(config.cuda_nonces_per_thread, 4);
         assert_eq!(config.cuda_block_size, 128);
@@ -501,6 +564,21 @@ mod tests {
                 "--config=missing-test-config.yaml",
                 arguments[0],
                 arguments[1],
+            ]);
+            if let Ok(args) = args {
+                assert!(load(args).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn validates_metal_launch_options() {
+        for argument in ["--metal-nonces-per-thread=3", "--metal-threadgroup-size=0"] {
+            let args = Args::try_parse_from([
+                "miner",
+                "--benchmark",
+                "--config=missing-test-config.yaml",
+                argument,
             ]);
             if let Ok(args) = args {
                 assert!(load(args).is_err());

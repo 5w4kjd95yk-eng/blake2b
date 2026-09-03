@@ -3,9 +3,30 @@ use std::any::Any;
 use anyhow::{bail, Result};
 
 use crate::{
-    config::{CudaKernel, GpuBackend, GpuDevices, OpenClKernel, OpenClTuning},
+    config::{
+        CudaKernel, GpuBackend, GpuDevices, MetalKernel, MetalTuning, OpenClKernel, OpenClTuning,
+    },
     protocol::JobSpec,
 };
+
+#[derive(Clone, Copy, Debug)]
+pub struct MetalOptions {
+    pub tuning: MetalTuning,
+    pub kernel: Option<MetalKernel>,
+    pub nonces_per_thread: Option<u32>,
+    pub threadgroup_size: Option<usize>,
+}
+
+impl Default for MetalOptions {
+    fn default() -> Self {
+        Self {
+            tuning: MetalTuning::Auto,
+            kernel: None,
+            nonces_per_thread: None,
+            threadgroup_size: None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CudaOptions {
@@ -83,10 +104,7 @@ pub trait Backend: Send {
 
 pub fn devices(requested: GpuBackend) -> Result<Vec<DeviceInfo>> {
     match resolve_backend(requested)? {
-        GpuBackend::Metal => {
-            let backend = metal::MetalBackend::new(1)?;
-            Ok(vec![backend.device_info().clone()])
-        }
+        GpuBackend::Metal => metal::devices(),
         GpuBackend::Cuda => cuda::devices(),
         GpuBackend::Opencl => opencl::devices(),
         GpuBackend::Auto => unreachable!(),
@@ -97,6 +115,7 @@ pub fn backends(
     requested: GpuBackend,
     selected: &GpuDevices,
     batch_size: u32,
+    metal_options: MetalOptions,
     cuda_options: CudaOptions,
     opencl_options: OpenClOptions,
 ) -> Result<Vec<Box<dyn Backend>>> {
@@ -106,7 +125,10 @@ pub fn backends(
             if indices != [0] {
                 bail!("Metal exposes only GPU device index 0");
             }
-            Ok(vec![Box::new(metal::MetalBackend::new(batch_size)?)])
+            Ok(vec![Box::new(metal::MetalBackend::new(
+                batch_size,
+                metal_options,
+            )?)])
         }
         GpuBackend::Cuda => {
             let available = cuda::devices()?;
@@ -170,21 +192,10 @@ mod tests {
     type ReferenceBlake2b256 = Blake2b<U32>;
 
     #[test]
-    fn metal_matches_reference_for_datum_layout() {
-        let Ok(mut backend) = backends(
-            GpuBackend::Metal,
-            &GpuDevices::default(),
-            1_024,
-            CudaOptions::default(),
-            OpenClOptions::default(),
-        )
-        .map(|mut backends| backends.remove(0)) else {
-            eprintln!("skipping Metal test because no GPU is exposed");
-            return;
-        };
+    fn metal_variants_match_reference_for_datum_layout() {
         let blob = vec![0x5a; 80];
         let start_nonce = u32::MAX as u64 - 511;
-        let mut hashes = (0..backend.batch_size())
+        let mut hashes = (0..1_024)
             .map(|offset| {
                 let nonce = start_nonce + offset;
                 (nonce, reference_hash(&blob, nonce))
@@ -205,11 +216,37 @@ mod tests {
             .iter()
             .filter_map(|(nonce, hash)| target.accepts(hash).then_some(*nonce))
             .collect::<Vec<_>>();
-        let job = backend.prepare_job(&spec, 1).unwrap();
-        let mut actual = backend.mine(job.as_ref(), start_nonce).unwrap();
         expected.sort_unstable();
-        actual.sort_unstable();
-        assert_eq!(actual, expected);
+        for kernel in [
+            MetalKernel::Baseline,
+            MetalKernel::ScalarSplit,
+            MetalKernel::ScalarNative,
+        ] {
+            for nonces_per_thread in [1, 2, 4] {
+                let metal_options = MetalOptions {
+                    tuning: crate::config::MetalTuning::Off,
+                    kernel: Some(kernel),
+                    nonces_per_thread: Some(nonces_per_thread),
+                    threadgroup_size: Some(64),
+                };
+                let Ok(mut backend) = backends(
+                    GpuBackend::Metal,
+                    &GpuDevices::default(),
+                    1_024,
+                    metal_options,
+                    CudaOptions::default(),
+                    OpenClOptions::default(),
+                )
+                .map(|mut backends| backends.remove(0)) else {
+                    eprintln!("skipping Metal test because no GPU is exposed");
+                    return;
+                };
+                let job = backend.prepare_job(&spec, 1).unwrap();
+                let mut actual = backend.mine(job.as_ref(), start_nonce).unwrap();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "{kernel:?} x{nonces_per_thread}");
+            }
+        }
     }
 
     fn reference_hash(blob: &[u8], nonce: u64) -> [u8; 32] {

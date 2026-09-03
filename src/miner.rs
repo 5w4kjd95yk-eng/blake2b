@@ -101,6 +101,7 @@ pub fn run(config: Config) -> Result<()> {
             config.gpu_backend,
             &config.gpu_devices,
             config.gpu_batch_size,
+            metal_options(&config),
             cuda_options(&config),
             opencl_options(&config),
         )?;
@@ -219,6 +220,15 @@ fn opencl_options(config: &Config) -> gpu::OpenClOptions {
         kernel: config.opencl_kernel,
         local_size: config.opencl_local_size,
         nonces_per_item: config.opencl_nonces_per_item,
+    }
+}
+
+fn metal_options(config: &Config) -> gpu::MetalOptions {
+    gpu::MetalOptions {
+        tuning: config.metal_tuning,
+        kernel: config.metal_kernel,
+        nonces_per_thread: config.metal_nonces_per_thread,
+        threadgroup_size: config.metal_threadgroup_size,
     }
 }
 
@@ -773,6 +783,7 @@ fn benchmark(config: &Config) -> Result<()> {
             config.gpu_backend,
             &config.gpu_devices,
             config.gpu_batch_size,
+            metal_options(config),
             cuda_options(config),
             opencl_options(config),
         )?;
