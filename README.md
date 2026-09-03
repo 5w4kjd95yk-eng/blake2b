@@ -56,6 +56,15 @@ in YAML as `cuda_kernel`, `cuda_nonces_per_thread`, and `cuda_block_size`.
 The selected kernel and launch geometry are printed when the CUDA backend is
 created. These overrides do not affect Metal or OpenCL.
 
+The Metal backend validates and profiles DATUM kernel, nonce-width, and
+threadgroup candidates on first use. Its selection is cached in
+`~/Library/Caches/blake2b-miner/metal-tuning.json`. Use
+`--metal-tuning=retune` after a hardware or operating-system change, or
+`--metal-tuning=off` for the legacy array/split kernel with four nonces per
+thread and a 64-thread group. `--metal-kernel`,
+`--metal-nonces-per-thread`, and `--metal-threadgroup-size` constrain the
+candidate set for diagnostics.
+
 `BLAKE2B_CUDA=off`, `auto`, or `force` explicitly controls CUDA detection and
 overrides the feature-derived mode. Automatic CUDA detection is disabled while
 cross-compiling. Use `--no-default-features` for a CPU-only build.
@@ -91,6 +100,7 @@ device: both # cpu, gpu, or both
 gpu_backend: auto # auto, metal, cuda, or opencl
 gpu_devices: all # one index, a YAML list such as [0, 2], or all
 gpu_batch_size: 1048576 # use 16777216 for balanced M4 Datum throughput
+metal_tuning: auto # auto, off, or retune; applies only to Metal
 
 reconnect_delay_seconds: 5
 stats_interval_seconds: 5
@@ -176,6 +186,13 @@ a 16,777,216-nonce batch improved from 453.5 MH/s to 460.1 MH/s. At the default
 1,048,576-nonce batch, eliminating per-batch synchronization overhead improved
 the result from 341.5 MH/s to 409.9 MH/s. These figures are device-specific;
 other OpenCL devices select and cache their own launch parameters.
+
+On a 32-core Apple M5 Max, Metal reached about 1.66 GH/s with a
+67,108,864-nonce batch. The automatic Metal tuner found no repeatable kernel
+improvement over the legacy array/split x4, 64-thread selection, and retained
+it. GPU-only mode sustained more total throughput than combining Metal with
+all available CPU workers. Detailed measurements are in
+[`docs/metal-m5-max.md`](docs/metal-m5-max.md).
 
 ## Wire format
 
