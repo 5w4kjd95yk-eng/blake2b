@@ -466,7 +466,7 @@ fn run_session(
         }
 
         if stats_requested.swap(false, Ordering::AcqRel)
-            || last_stats.elapsed() >= config.stats_interval
+            || (!config.stats_interval.is_zero() && last_stats.elapsed() >= config.stats_interval)
         {
             let now = Instant::now();
             let (cpu, gpu) = hashes.snapshot();

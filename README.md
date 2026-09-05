@@ -103,7 +103,7 @@ gpu_batch_size: 1048576 # use 16777216 for balanced M4 Datum throughput
 metal_tuning: auto # auto, off, or retune; applies only to Metal
 
 reconnect_delay_seconds: 5
-stats_interval_seconds: 5
+stats_interval_seconds: 5 # set to 0 to print stats only on SIGINFO (Ctrl-T)
 ```
 
 Credentials may be embedded in the URL:

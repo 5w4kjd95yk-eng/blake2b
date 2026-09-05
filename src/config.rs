@@ -422,7 +422,7 @@ pub fn load(args: Args) -> Result<Config> {
         opencl_local_size,
         opencl_nonces_per_item: args.opencl_nonces_per_item.or(file.opencl_nonces_per_item),
         reconnect_delay: Duration::from_secs(file.reconnect_delay_seconds.unwrap_or(5)),
-        stats_interval: Duration::from_secs(file.stats_interval_seconds.unwrap_or(5).max(1)),
+        stats_interval: Duration::from_secs(file.stats_interval_seconds.unwrap_or(5)),
         benchmark: args.benchmark,
         benchmark_duration: Duration::from_secs(args.benchmark_seconds),
         list_devices: args.list_devices,
